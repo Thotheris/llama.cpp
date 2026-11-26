@@ -1,5 +1,9 @@
 // k_pair is the K coordinate measured in FLOAT_TYPEV2 elements.
 uint a_shmem_index(uint m, uint k_pair) {
+    if (MMID_LANE_A) {
+        // 8x16 A matrix of rows m & ~7, k-pairs k_pair & ~7 in lane order: lane (m % 2) * 8 + k_pair % 8, dword (m % 8) / 2
+        return (k_pair / 8) * BM * 8 + (m & ~7u) * 8 + ((m & 1u) * 8 + (k_pair & 7u)) * 4 + ((m & 7u) >> 1);
+    }
     if (APPLY_SLM_A_RESHAPE) {
         const uint tile_width = TK / 2;
         return (k_pair / tile_width) * BM * tile_width
@@ -9,6 +13,11 @@ uint a_shmem_index(uint m, uint k_pair) {
     return m * SHMEM_STRIDE + k_pair;
 }
 
+// distance between consecutive k-pairs of one row inside a 16-wide k-slab
+uint a_kp_stride() {
+    return MMID_LANE_A ? 4 : 1;
+}
+
 uint a_shmem_stride() {
     return APPLY_SLM_A_RESHAPE ? TK / 2 : SHMEM_STRIDE;
 }
@@ -16,6 +25,78 @@ uint a_shmem_stride() {
 void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
     buf_a[a_shmem_index(m, k_pair)] = value;
 }
+
+#if defined(MULMAT_QUANT) && defined(MUL_MAT_ID)
+// Q4_K, 16 consecutive weights of one 32-weight sub-block (same arithmetic as the 4-wide path).
+// hdr = block words 0..3 (dm, scales[0..2]); qv = the 16 qs bytes; s2 = 16-weight group of the lane pair (even, uniform:
+// the rows of a Q4_K matrix are whole 256-weight blocks), row = 0/1 = which 16 of the 32 weights of the sub-block.
+void q4k16_store(const uint row, const uint col, const uvec4 hdr, const uvec4 qv, const uint s2) {
+    const uint k_pair = row * 8;
+    const uint n  = s2 / 4;                    // 64-weight chunk 0..3
+    const uint b  = (s2 / 2) % 2;              // low/high nibble
+    const uint is = 2 * n + b;                 // sub-block 0..7
+
+    const vec2 loadd = unpackHalf2x16(hdr.x);
+    const uvec3 scales = hdr.yzw;
+    const uint scalesoffs = (is & 3) * 8;
+
+    const uint scidx0 = (is < 4) ? 0 : 2;
+    const uint scidxshift0 = scalesoffs;
+    const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+    const uint mbidx0 = (is < 4) ? 1 : 2;
+    const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
+    const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+
+    const uint sc    = ((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30);
+    const uint mbyte = ((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30);
+
+    const float d = loadd.x * float(sc);
+    const float m = -loadd.y * float(mbyte);
+
+    // the 8 k-pairs of one row sit in one k-slab (TK/2 == 8 with the reshape), a_kp_stride() apart
+    const uint base = a_shmem_index(col, k_pair);
+    [[unroll]] for (uint t = 0; t < 4; t++) {
+        const uint w = (qv[t] >> (b * 4)) & 0x0F0F0F0F;
+        buf_a[base + (2 * t)     * a_kp_stride()] = FLOAT_TYPEV2(fma(d, float(w & 0xFF), m), fma(d, float((w >> 8) & 0xFF), m));
+        buf_a[base + (2 * t + 1) * a_kp_stride()] = FLOAT_TYPEV2(fma(d, float((w >> 16) & 0xFF), m), fma(d, float(w >> 24), m));
+    }
+}
+#endif
+
+#if defined(MULMAT_QUANT) && defined(MUL_MAT_ID) && defined(COOPMAT)
+// Q8_0 / Q5_0 into lane-ordered A k-slabs, one 16-byte lane fragment per store (BM == 128, BK == 32, 256 invocations):
+// invocation t fills lane L = t % 16 of row group t / 16 in both k-slabs: rows 8 (t / 16) + 2 g + L / 8, k-pairs L % 8
+// and L % 8 + 8 of the step's 32-weight block. Same arithmetic as the 4-wide loaders.
+void q8_0_frag_load(const uint pos_a) {
+    const uint L = gl_LocalInvocationID.x % 16;
+    const uint kp = L % 8;
+    FLOAT_TYPEV2 f0[4], f1[4];
+    [[unroll]] for (uint g = 0; g < 4; g++) {
+        const uint ib = (pos_a + mmid_q8_rowoff[g]) / 8;
+        if (MmTypeA == GGML_TYPE_Q5_0) {
+            const float d = float(a_q5_0_p16.data[ib].d);
+            const uint uint_qh = uint(a_q5_0_p16.data[ib].qh[1]) << 16 | uint(a_q5_0_p16.data[ib].qh[0]);
+            const ivec2 qh0 = ivec2(((uint_qh >> 2*kp) << 4) & 0x10, (uint_qh >> (2*kp + 12)) & 0x10);
+            const ivec2 qh1 = ivec2(((uint_qh >> (2*kp + 1)) << 4) & 0x10, (uint_qh >> (2*kp + 13)) & 0x10);
+            const uint vui = uint(a_q5_0_p16.data[ib].qs[kp]);
+            const vec4 v = (vec4((vui & 0xF) | qh0.x, ((vui >> 4) & 0xF) | qh0.y, ((vui >> 8) & 0xF) | qh1.x, (vui >> 12) | qh1.y) - 16.0f) * d;
+            f0[g] = FLOAT_TYPEV2(v.xz);
+            f1[g] = FLOAT_TYPEV2(v.yw);
+        } else {
+            const float d = float(a_q8_0_p16.data[ib].d);
+            const i8vec2 v0 = unpack8(int32_t(a_q8_0_p16.data[ib].qs[kp])).xy;
+            const i8vec2 v1 = unpack8(int32_t(a_q8_0_p16.data[ib].qs[kp + 8])).xy;
+            f0[g] = FLOAT_TYPEV2(vec2(v0.x, v0.y) * d);
+            f1[g] = FLOAT_TYPEV2(vec2(v1.x, v1.y) * d);
+        }
+    }
+    const uint base = (gl_LocalInvocationID.x / 16) * 64 + L * 4;
+    [[unroll]] for (uint g = 0; g < 4; g++) {
+        buf_a[base + g] = f0[g];
+        buf_a[BM * 8 + base + g] = f1[g];
+    }
+}
+#endif
 
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
@@ -502,6 +583,12 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                         dl * (qs.y - hm.y)));
 
     } else if (MmTypeA == GGML_TYPE_Q4_K) {
+#ifdef MUL_MAT_ID
+        const uint idx = pos_a + col * p.stride_a / 16 + row;
+        const uint ib = idx / 16;
+        const uint s2 = pos_a % 16;  // == (idx - row) % 16: the 2 lanes of a pair start at an even group
+        q4k16_store(row, col, a_q4_k_p128.data[ib].q4k[0], a_q4_k_p128.data[ib].q4k[1 + 2 * (s2 / 4) + row], s2);
+#else
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 2;
 
@@ -537,6 +624,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
         store_a(col, k_pair, FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m)));
         store_a(col, k_pair + 1, FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m)));
+#endif
     } else if (MmTypeA == GGML_TYPE_Q5_K) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 2;
@@ -641,7 +729,7 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 #if LOAD_VEC_B == 8
     if (ALIGNED != 0) {
         // Not supported for b_type bf16 because bf16mat2x4 does not exist
-        const uint idx = pos_b + col * p.stride_b / LOAD_VEC_B + row;
+        const uint idx = pos_b + col * DENSE_STRIDE_B / LOAD_VEC_B + row;
         const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
         FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
         buf_b[buf_idx + 0] = bb[0].xy;
@@ -652,7 +740,7 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
     }
 #elif LOAD_VEC_B == 4
     if (ALIGNED != 0) {
-        const uint idx = pos_b + col * p.stride_b / LOAD_VEC_B + row;
+        const uint idx = pos_b + col * DENSE_STRIDE_B / LOAD_VEC_B + row;
         const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
 #if defined(DATA_B_BF16)
         FLOAT_TYPEV4 bb = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_b[idx]));
@@ -664,7 +752,7 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
         return;
     }
 #endif
-    const uint idx = pos_b + col * p.stride_b + row * 2;
+    const uint idx = pos_b + col * DENSE_STRIDE_B + row * 2;
     const uint buf_idx = col * SHMEM_STRIDE + row;
     if (idx_n < p.N && block + row * 2 + 1 < end_k) {
         buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
@@ -676,6 +764,32 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
     }
 }
 #else
+#if LOAD_VEC_B == 8 || LOAD_VEC_B == 4
+// Loop-invariant part of the aligned B index for tile column col (padding columns read row 0).
+uint load_b_row_offset(const uint row, const uint col, const uint _ne1) {
+    const u16vec2 row_idx = col < _ne1 ? row_ids[col] : u16vec2(0);
+    return row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
+}
+
+void load_b_to_shmem_off(const uint idx, const uint row, const uint col) {
+    const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
+#if LOAD_VEC_B == 8
+    FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
+    buf_b[buf_idx + 0] = bb[0].xy;
+    buf_b[buf_idx + 1] = bb[0].zw;
+    buf_b[buf_idx + 2] = bb[1].xy;
+    buf_b[buf_idx + 3] = bb[1].zw;
+#else
+#if defined(DATA_B_BF16)
+    FLOAT_TYPEV4 bb = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_b[idx]));
+#else
+    FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
+#endif
+    buf_b[buf_idx + 0] = bb.xy;
+    buf_b[buf_idx + 1] = bb.zw;
+#endif
+}
+#endif
 void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint ic, const uint _ne1, const uint block, const uint end_k) {
 #if LOAD_VEC_B == 8
     if (ALIGNED != 0) {

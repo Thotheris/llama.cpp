@@ -1,0 +1,109 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// The combine step of the split-KV decode flash attention (flash_attn_decode_split.comp). Split s wrote its partial
+// O_s and L_s relative to its own max m_s; with M = max m_s: O = sum_s O_s exp(m_s - M) / (sum_s L_s exp(m_s - M)
+// [+ exp(sink - M)]). One workgroup per output row (query row x head): the weights exp(m_s - M) of the splits are
+// computed once in shared memory, then one invocation per value sums the splits in order.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint WorkGroupSize = 128;
+
+// [n_split][n_rows * HSV] partial O, then [n_split][n_rows] partial L, then [n_split][n_rows] partial max
+layout (binding = 0) readonly  buffer PART {float data_part[];};
+layout (binding = 1) readonly  buffer S    {float data_s[];};
+layout (binding = 2) writeonly buffer O    {float data_o[];};
+
+layout (push_constant) uniform parameter
+{
+    uint n_split;
+    uint n_rows;
+    uint hsv;
+    uint n_head;
+    uint flag;
+} p;
+
+#define SINK_ENABLE_BIT (1 << 16)
+// the host keeps n_split <= MAX_SPLIT
+#define MAX_SPLIT 256
+
+shared float sh_w[MAX_SPLIT];
+shared float sh_red[WorkGroupSize];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint o_stride = p.n_rows * p.hsv;
+    const uint l_base   = p.n_split * o_stride;
+    const uint m_base   = l_base + p.n_split * p.n_rows;
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
+    // M: the max of the split maxes
+    float mx = NEG_FLT_MAX_OVER_2;
+    for (uint s = tid; s < p.n_split; s += WorkGroupSize) {
+        mx = max(mx, data_part[m_base + s * p.n_rows + row]);
+    }
+    sh_red[tid] = mx;
+    barrier();
+    [[unroll]] for (uint w = WorkGroupSize / 2; w > 0; w >>= 1) {
+        if (tid < w) {
+            sh_red[tid] = max(sh_red[tid], sh_red[tid + w]);
+        }
+        barrier();
+    }
+    const float Mf = sh_red[0];
+    barrier();
+
+    // the weights of the splits and L
+    float ls = 0.0f;
+    for (uint s = tid; s < p.n_split; s += WorkGroupSize) {
+        const float w = exp(data_part[m_base + s * p.n_rows + row] - Mf);
+        sh_w[s] = w;
+        ls += data_part[l_base + s * p.n_rows + row] * w;
+    }
+    sh_red[tid] = ls;
+    barrier();
+    [[unroll]] for (uint w = WorkGroupSize / 2; w > 0; w >>= 1) {
+        if (tid < w) {
+            sh_red[tid] = sh_red[tid] + sh_red[tid + w];
+        }
+        barrier();
+    }
+    const float l = sh_red[0];
+
+    float rcp;
+    if ((p.flag & SINK_ENABLE_BIT) != 0) {
+        // as the epilogue of phase 2
+        const float sink = data_s[row % p.n_head];
+        float sink_emf   = exp(Mf - sink);
+        const float Lf_sink = l * sink_emf;
+        rcp = 1.0f / (l + 1.0f / sink_emf);
+        sink_emf = sink_emf / (1.0f + Lf_sink);
+        rcp = (Mf < sink) ? sink_emf : rcp;
+    } else {
+        rcp = (l == 0.0f) ? 0.0f : (1.0f / l);
+    }
+
+    for (uint d = tid; d < p.hsv; d += WorkGroupSize) {
+        float o = 0.0f;
+        uint s = 0;
+        // four independent loads in flight
+        for (; s + 4 <= p.n_split; s += 4) {
+            const float o0 = data_part[(s    ) * o_stride + row * p.hsv + d];
+            const float o1 = data_part[(s + 1) * o_stride + row * p.hsv + d];
+            const float o2 = data_part[(s + 2) * o_stride + row * p.hsv + d];
+            const float o3 = data_part[(s + 3) * o_stride + row * p.hsv + d];
+            o += o0 * sh_w[s];
+            o += o1 * sh_w[s + 1];
+            o += o2 * sh_w[s + 2];
+            o += o3 * sh_w[s + 3];
+        }
+        for (; s < p.n_split; ++s) {
+            o += data_part[s * o_stride + row * p.hsv + d] * sh_w[s];
+        }
+        data_o[row * p.hsv + d] = o * rcp;
+    }
+}

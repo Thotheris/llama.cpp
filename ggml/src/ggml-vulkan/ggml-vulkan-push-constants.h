@@ -111,6 +111,18 @@ struct vk_mat_vec_id_push_constants {
     uint32_t nbi1;
 };
 
+struct vk_mat_vec_idt_push_constants {
+    uint32_t ncols;
+    uint32_t stride_b;
+    uint32_t batch_stride_a;
+    uint32_t batch_stride_b;
+    uint32_t stride_d;
+    uint32_t batch_stride_d;
+    uint32_t ne11;
+    uint32_t nrows;
+    uint32_t row_ids_offset;
+};
+
 struct vk_flash_attn_push_constants {
     uint32_t N;
     uint32_t KV;
@@ -178,6 +190,25 @@ struct vk_xe_fa_push_constants {
     uint32_t nb3;
     uint32_t flag;
     float scale;
+    // relative-position bias (ggml_flash_attn_ext_set_rel_bias), strides in elements
+    uint32_t nbp1;   // pos row (query)
+    uint32_t nbp3;   // pos stream
+    uint32_t nbb1;   // bias row (query)
+    uint32_t nbb2;   // bias head
+    uint32_t nbb3;   // bias stream
+    uint32_t neb2;   // bias heads
+    int32_t  masked_pos;
+};
+
+static_assert(sizeof(vk_xe_fa_push_constants) <= 128, "sizeof(vk_xe_fa_push_constants) must be <= 128");
+
+// flash_attn_decode_combine.comp
+struct vk_xe_fa_combine_push_constants {
+    uint32_t n_split;
+    uint32_t n_rows;
+    uint32_t hsv;
+    uint32_t n_head;
+    uint32_t flag;
 };
 
 struct vk_op_push_constants {
@@ -317,6 +348,8 @@ struct vk_op_glu_push_constants {
     uint32_t ne2_012mp; uint32_t ne2_012L;
     uint32_t ne2_01mp;  uint32_t ne2_01L;
     uint32_t ne2_0mp;   uint32_t ne2_0L;
+    float param3; // for situ: 1/beta
+    float param4; // for situ: 1/lb
 };
 
 static_assert(sizeof(vk_op_glu_push_constants) <= 128, "sizeof(vk_op_glu_push_constants) must be <= 128");
@@ -536,6 +569,17 @@ struct vk_op_topk_moe_push_constants {
     uint32_t with_norm;
     float output_scale;
     float output_bias;
+};
+
+struct vk_op_topk_moe_sort_push_constants {
+    uint32_t n_experts;
+    uint32_t n_expert_used;
+    uint32_t n_rows;
+    uint32_t ids_stride;
+    float eps_scale;
+    float eps_bias;
+    float out_scale;
+    float out_bias;
 };
 
 struct vk_op_add_id_push_constants {
@@ -816,6 +860,35 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+struct vk_op_ssm_conv_hist_push_constants {
+    uint32_t nbp1, nbp2;
+    uint32_t nbx1, nbx2;
+    uint32_t nbc1;
+    uint32_t nbs1, nbs2;
+    uint32_t nbd1, nbd2;
+    uint32_t nc, nr, n_t, n_s;
+    uint32_t has_store;          // the number of store slots (0: no store)
+    uint32_t op, ox, oc, os, od; // misalignment of past, x, c, store and dst in elements
+    uint32_t nbs3;               // store slot stride
+};
+
+struct vk_op_ssm_conv_hist_post_push_constants {
+    uint32_t nbp1, nbp2;
+    uint32_t nbx1, nbx2;
+    uint32_t nbc1;
+    uint32_t nbs1, nbs2;
+    uint32_t nbd1, nbd2;
+    uint32_t nba1, nba2;
+    uint32_t nc, nr, n_t, n_s;
+    uint32_t has_store, has_add;
+    uint32_t post;
+    float    param;
+    uint32_t ncols;
+    uint32_t op, ox, oc, os, oa, od; // misalignment of past, x, c, store, add and dst in elements
+    uint32_t set_rows, nbr1, oi;     // fused SET_ROWS: 0 none, 1 F32, 2 F16 rows; row stride; misalignment of the indices
+    uint32_t nbs3;                   // store slot stride (has_store: the number of slots)
+};
+
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
     uint32_t Cin;
@@ -953,9 +1026,131 @@ template <> inline void init_pushconst_fastdiv(vk_op_sum_rows_push_constants &p)
     init_fastdiv_values(p.ne01,        p.ne0_1mp,  p.ne0_1L);
 }
 
+struct vk_op_l2_clip_push_constants
+{
+    uint32_t n_cols;
+    uint32_t ne01, ne02, ne03;
+    uint32_t nb01, nb02, nb03;
+    uint32_t nb11, nb12, nb13;
+    uint32_t has_scale;
+    uint32_t sne1, sne2, sne3;
+    uint32_t snb1, snb2, snb3;
+    float threshold;
+    uint32_t misalign_offsets;
+    uint32_t ne0_12mp, ne0_12L;
+    uint32_t ne0_1mp, ne0_1L;
+};
+
+static_assert(sizeof(vk_op_l2_clip_push_constants) <= 128, "sizeof(vk_op_l2_clip_push_constants) must be <= 128");
+
+template <> inline void init_pushconst_fastdiv(vk_op_l2_clip_push_constants &p) {
+    init_fastdiv_values(p.ne01*p.ne02, p.ne0_12mp, p.ne0_12L);
+    init_fastdiv_values(p.ne01,        p.ne0_1mp,  p.ne0_1L);
+}
+
+struct vk_op_gate_mix_push_constants
+{
+    uint32_t ne;
+    uint32_t ne0;
+    uint32_t nbx1, nbx2, nbx3;
+    uint32_t nbm1, nbm2, nbm3;
+    uint32_t nbg1, nbg2, nbg3;
+    uint32_t nbd1, nbd2, nbd3;
+    uint32_t ox, om, og, od; // misalignment of x, m, g and dst in elements
+    uint32_t tanh_gates;
+    uint32_t ne012mp, ne012L;
+    uint32_t ne01mp, ne01L;
+    uint32_t ne0mp, ne0L;
+    uint32_t ne012, ne01;
+};
+
+static_assert(sizeof(vk_op_gate_mix_push_constants) <= 128, "sizeof(vk_op_gate_mix_push_constants) must be <= 128");
+
+template <> inline void init_pushconst_fastdiv(vk_op_gate_mix_push_constants &p) {
+    init_fastdiv_values(p.ne012, p.ne012mp, p.ne012L);
+    init_fastdiv_values(p.ne01,  p.ne01mp,  p.ne01L);
+    init_fastdiv_values(p.ne0,   p.ne0mp,   p.ne0L);
+}
+
+struct vk_op_block_mix_push_constants
+{
+    uint32_t ne0;
+    uint32_t n_stack;
+    uint32_t large;
+    uint32_t chunk;
+    uint32_t nbc2;
+    uint32_t nbq1;
+    uint32_t nbs1, nbs2;
+    uint32_t nbd1, nbd2;
+    uint32_t oc, oq, os, od; // misalignment of cur, query, stack and dst in elements
+    float scale;
+    // block_mix_multi.comp only
+    uint32_t n_qw; // queries per workgroup
+    uint32_t n_q;
+    uint32_t vec4_strides; // ne0, chunk and the row strides are multiples of 4 (the shader checks the misalignments)
+    // block_mix_norm.comp only
+    uint32_t flags;        // 1: norm of cur, 2: norm of the result, 4: raw result in plane 1, 8: norm weight
+    float    eps_in;
+    float    eps_out;
+    uint32_t nbw1;         // weight row stride (0: one row for every query)
+    uint32_t ow;           // misalignment of the weight in elements
+    uint32_t nbd3;         // dst plane stride
+    uint32_t rms_bs;       // the workgroup size of the rms_norm pipeline for ne0
+    uint32_t rms_sg;       // and its subgroup size (16 or 32)
+};
+
+static_assert(sizeof(vk_op_block_mix_push_constants) <= 128, "sizeof(vk_op_block_mix_push_constants) must be <= 128");
+
+struct vk_op_gate_mix_mm_push_constants
+{
+    uint32_t ne0;
+    uint32_t n;
+    uint32_t k;
+    uint32_t nbw1, nbz1, nbx1, nbm1, nbd1;
+    uint32_t ow, oz, ox, om, od;
+};
+
+struct vk_op_gate_mix_mv_push_constants
+{
+    uint32_t n;
+    uint32_t k;
+    uint32_t nbx, nbm, nbz, nbd;
+    uint32_t ox, om, ow4, oz, od; // misalignment of x, m, z, dst (in elements) and w (in vec4)
+    uint32_t nbw4; // the row stride of w in vec4: 0 for one weight for all rows
+};
+
+static_assert(sizeof(vk_op_gate_mix_mv_push_constants) <= 128, "sizeof(vk_op_gate_mix_mv_push_constants) must be <= 128");
+
+struct vk_op_rel_bias_push_constants
+{
+    uint32_t n_rel, n_head, n_kv, n_tps, hg;
+    uint32_t nbr1, nbr2, nbs1, nbt1, nbt2, nbu2, nbc1, nbp1, nbd1, nbd2, nbd3; // strides in elements
+    uint32_t has_scale, has_tau, pairs;
+    float threshold;
+    uint32_t o_r, o_s, o_t, o_u, o_c, o_p, o_d; // misalignment in elements
+    uint32_t has_pos;
+};
+
+static_assert(sizeof(vk_op_rel_bias_push_constants) <= 128, "sizeof(vk_op_rel_bias_push_constants) must be <= 128");
+
 struct vk_quantize_q8_1_push_constants {
     uint32_t ne;
     uint32_t num_blocks;
+};
+
+// quantize_q8_1 with FUSE_SITU: the input is situ(gate, up), computed from the split GLU sources
+struct vk_quantize_q8_1_situ_push_constants {
+    uint32_t ne;
+    uint32_t num_blocks;
+    uint32_t ncols;
+    uint32_t nba1;
+    uint32_t nbb1;
+    uint32_t oa;
+    uint32_t ob;
+    float alpha;
+    float limit;
+    float param3;
+    float param4;
 };
 
 struct vk_op_flash_attn_split_k_reduce_push_constants {
@@ -1148,6 +1343,43 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
     GGML_UNUSED(src1);
     GGML_UNUSED(src2);
     GGML_UNUSED(src3);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_l2_clip_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    const uint32_t a_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    const uint32_t b_offset = src1 ? get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type) : 0;
+    const uint32_t d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
+
+    p.misalign_offsets = (a_offset << 16) | (b_offset << 8) | d_offset;
+
+    GGML_UNUSED(src2);
+    GGML_UNUSED(src3);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_gate_mix_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.ox = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.om = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.og = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
+    p.od = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+
+    GGML_UNUSED(src3);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_gate_mix_mv_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    GGML_ASSERT(get_misalign_bytes(ctx, src2) % 16 == 0);
+    p.ox  = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.om  = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.ow4 = get_misalign_bytes(ctx, src2) / 16;
+    p.oz  = get_misalign_bytes(ctx, src3) / ggml_type_size(src3->type);
+    p.od  = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_block_mix_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.oc = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.oq = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.os = src2 ? get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type) : 0;
+    p.od = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+    p.ow = src3 ? get_misalign_bytes(ctx, src3) / ggml_type_size(src3->type) : 0;
 }
 
 template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_pad_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {

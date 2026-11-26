@@ -1,0 +1,195 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Attention over a stack of states. Workgroup (c, q, t) handles query q of token t and writes chunk c of the output:
+//   states s_k = [stack rows 0..n_stack-1, cur] of token t
+//   d_k = dot(s_k, query_q), w = softmax(scale*d), y[:, q, t] = sum_k w_k*s_k
+// It replaces the CONCAT, MUL_MAT (mul_mat_vec), SOFT_MAX, (CONT) and OUT_PROD chain and keeps its rounding:
+// - each dot product is computed by a group of threads with the per-thread partial sums, subgroupAdd and
+//   cross-subgroup sum of the f32 mul_mat_vec.comp pipeline that the matvec would pick (large: 4 subgroups per
+//   dot, else one subgroup per dot), with the same required subgroup size;
+// - the softmax follows soft_max.comp for rows no longer than its block (one column per thread, shared-memory trees);
+// - the weighted sum is the out_prod.comp loop;
+// the values the chain stored to memory are marked precise where they feed a later add.
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 256; // 16 subgroups
+layout (constant_id = 1) const uint SG_SIZE = 16;     // the mul_mat_vec subgroup size
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer C {float data_c[];};
+layout (binding = 1) readonly buffer Q {float data_q[];};
+layout (binding = 2) readonly buffer S {float data_s[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+// vk_op_block_mix_push_constants
+layout (push_constant) uniform parameter
+{
+    uint ne0;
+    uint n_stack;
+    uint large;
+    uint chunk;
+    uint nbc2;
+    uint nbq1;
+    uint nbs1, nbs2;
+    uint nbd1, nbd2;
+    uint oc, oq, os, od;
+    float scale;
+} p;
+
+#define MAX_STATES    16
+#define MAX_PER_GROUP 4 // MAX_STATES / (fewest dot groups = 4)
+
+shared float part[MAX_STATES][4];
+shared float dots[MAX_STATES];
+
+vec4 load_state4(const uint k, const uint t, const uint e) {
+    if (k < p.n_stack) {
+        const uint i = p.os + t*p.nbs2 + k*p.nbs1 + e;
+        return vec4(data_s[i], data_s[i + 1], data_s[i + 2], data_s[i + 3]);
+    }
+    const uint i = p.oc + t*p.nbc2 + e;
+    return vec4(data_c[i], data_c[i + 1], data_c[i + 2], data_c[i + 3]);
+}
+
+float load_state(const uint k, const uint t, const uint e) {
+    if (k < p.n_stack) {
+        return data_s[p.os + t*p.nbs2 + k*p.nbs1 + e];
+    }
+    return data_c[p.oc + t*p.nbc2 + e];
+}
+
+vec4 load_query4(const uint qoff, const uint col) {
+    return vec4(data_q[qoff + col], data_q[qoff + col + 1], data_q[qoff + col + 2], data_q[qoff + col + 3]);
+}
+
+// temp += dot(v, b) as the compiler emits it in mul_mat_vec.comp: the accumulator goes into the innermost fma
+// and the components are taken last to first (observed with probe inputs on Xe2 / ANV)
+float dot_acc(const vec4 v, const vec4 b, const float acc) {
+    return fma(v.x, b.x, fma(v.y, b.y, fma(v.z, b.z, fma(v.w, b.w, acc))));
+}
+
+void main() {
+    const uint c   = gl_WorkGroupID.x;
+    const uint q   = gl_WorkGroupID.y;
+    const uint t   = gl_WorkGroupID.z;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint n_states = p.n_stack + 1;
+    const uint qoff     = p.oq + q*p.nbq1;
+
+    // P threads per dot (the matvec workgroup), G dot groups; group g takes the states g, g + G, ...
+    const uint P    = p.large != 0 ? 4*SG_SIZE : SG_SIZE;
+    const uint G    = BLOCK_SIZE / P;
+    const uint g    = tid / P;
+    const uint lane = tid % P;
+    const uint step = 4*P;
+
+    float temp[MAX_PER_GROUP];
+    [[unroll]] for (uint j = 0; j < MAX_PER_GROUP; ++j) {
+        temp[j] = 0.0f;
+    }
+
+    // the columns 4*lane + i*step of each dot, in order; three steps at a time with the loads first
+    uint col = 4*lane;
+    for (; col + 2*step < p.ne0; col += 3*step) {
+        const vec4 b0 = load_query4(qoff, col);
+        const vec4 b1 = load_query4(qoff, col + step);
+        const vec4 b2 = load_query4(qoff, col + 2*step);
+        [[unroll]] for (uint j = 0; j < MAX_PER_GROUP; ++j) {
+            const uint k = g + G*j;
+            if (k < n_states) {
+                const vec4 v0 = load_state4(k, t, col);
+                const vec4 v1 = load_state4(k, t, col + step);
+                const vec4 v2 = load_state4(k, t, col + 2*step);
+                temp[j] = dot_acc(v0, b0, temp[j]);
+                temp[j] = dot_acc(v1, b1, temp[j]);
+                temp[j] = dot_acc(v2, b2, temp[j]);
+            }
+        }
+    }
+    for (; col < p.ne0; col += step) {
+        const vec4 b0 = load_query4(qoff, col);
+        [[unroll]] for (uint j = 0; j < MAX_PER_GROUP; ++j) {
+            const uint k = g + G*j;
+            if (k < n_states) {
+                temp[j] = dot_acc(load_state4(k, t, col), b0, temp[j]);
+            }
+        }
+    }
+
+    // subgroupAdd, then (large) the subgroups of a dot summed in order from 0, as mul_mat_vec's reduce_result
+    [[unroll]] for (uint j = 0; j < MAX_PER_GROUP; ++j) {
+        const uint k = g + G*j;
+        if (k < n_states) {
+            const float s = subgroupAdd(temp[j]);
+            if (gl_SubgroupInvocationID == 0) {
+                part[k][lane / SG_SIZE] = s;
+            }
+        }
+    }
+    barrier();
+    if (tid < n_states) {
+        float d;
+        if (p.large != 0) {
+            d = 0.0f;
+            [[unroll]] for (uint s = 0; s < 4; ++s) {
+                d += part[tid][s];
+            }
+        } else {
+            d = part[tid][0];
+        }
+        dots[tid] = d;
+    }
+    barrier();
+
+    // soft_max.comp with one column per thread: max, exp(v - max), tree sum, times 1/sum
+    float max_val = uintBitsToFloat(0xFF800000);
+    float v[MAX_STATES];
+    [[unroll]] for (uint k = 0; k < MAX_STATES; ++k) {
+        if (k < n_states) {
+            precise float vk = dots[k] * p.scale;
+            v[k] = vk;
+            max_val = max(max_val, vk);
+        }
+    }
+
+    float ex[MAX_STATES];
+    float vals[MAX_STATES];
+    [[unroll]] for (uint k = 0; k < MAX_STATES; ++k) {
+        if (k < n_states) {
+            precise float x = v[k] - max_val;
+            ex[k] = exp(x);
+        } else {
+            ex[k] = 0.0f;
+        }
+        vals[k] = ex[k];
+    }
+    [[unroll]] for (uint s = MAX_STATES / 2; s > 0; s >>= 1) {
+        [[unroll]] for (uint i = 0; i < s; ++i) {
+            vals[i] += vals[i + s];
+        }
+    }
+    const float sum = vals[0];
+    float rcpdivisor = 1.0/sum;
+
+    float w[MAX_STATES];
+    [[unroll]] for (uint k = 0; k < MAX_STATES; ++k) {
+        precise float wk = ex[k] * rcpdivisor;
+        w[k] = wk;
+    }
+
+    // out_prod.comp: sum += a*b over the states, for the elements of chunk c
+    const uint e1 = min(p.ne0, (c + 1)*p.chunk);
+    for (uint e = c*p.chunk + tid; e < e1; e += BLOCK_SIZE) {
+        float acc = 0.0f;
+        [[unroll]] for (uint k = 0; k < MAX_STATES; ++k) {
+            if (k < n_states) {
+                acc += load_state(k, t, e) * w[k];
+            }
+        }
+        data_d[p.od + t*p.nbd2 + q*p.nbd1 + e] = acc;
+    }
+}

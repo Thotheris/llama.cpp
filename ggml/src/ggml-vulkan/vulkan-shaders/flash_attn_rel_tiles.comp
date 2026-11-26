@@ -1,0 +1,121 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// The tile flags of flash_attn_prefill_rel.comp, once per (row block, batch) instead of once per workgroup (head):
+// for the Wr-row block y of batch z and the Bc-cell tiles [32 x, 32 x + 32), two words
+//   live: bit i set when some row of the block sees some cell of tile 32 x + i (a pos != masked_pos)
+//   nonu: bit i set when the tile is not uniform: some pos of a cell of the tile in some row of the block differs from
+//         u_pos, the pos of the first cell in the first row of the block
+// at [((z * n_rb + y) * 2 + {0: live, 1: nonu}) * n_words + x], n_words = gl_NumWorkGroups.x.
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer POS {int data_pos[];};
+layout (binding = 0) readonly buffer POSV4 {ivec4 data_posv4[];};
+layout (binding = 1) writeonly buffer TL {uint data_tl[];};
+
+// the push constants of flash_attn_prefill_rel.comp
+layout (push_constant) uniform parameter
+{
+    uint neq1;
+    uint neq2;
+    uint neq3;
+    uint nek1;
+    uint nek2;
+    uint nek3;
+    uint nev2;
+    uint nev3;
+    uint nem1;
+    uint nem2;
+    uint nem3;
+    uint nbq1;
+    uint nbq2;
+    uint nbk1;
+    uint nbk2;
+    uint nbv1;
+    uint nbv2;
+    uint nbq3;
+    uint nbk3;
+    uint nbv3;
+    uint nb3;
+    uint flag;
+    float scale;
+    uint nbp1;
+    uint nbp3;
+    uint nbb1;
+    uint nbb2;
+    uint nbb3;
+    uint neb2;
+    int  masked_pos;
+} p;
+
+layout (constant_id = 0) const uint Wr = 64;
+layout (constant_id = 1) const uint Bc = 32;
+// 1: nek1 is not a multiple of Bc
+layout (constant_id = 2) const uint Unaligned = 0;
+
+const uint WorkGroupSize = 256;
+
+shared uint sh_bits[2];
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint batch = gl_WorkGroupID.z;
+    const uint row_base = gl_WorkGroupID.y * Wr;
+    const uint n_words = gl_NumWorkGroups.x;
+    const uint loop_count = (p.nek1 + Bc - 1) / Bc;
+
+    if (tid < 2) {
+        sh_bits[tid] = 0;
+    }
+    barrier();
+
+    const int u_pos = data_pos[min(row_base, p.neq1 - 1) * p.nbp1 + batch * p.nbp3];
+    // Wr is a multiple of the subgroup size: the lanes of a subgroup visit the same tiles
+    const uint phases = WorkGroupSize / Wr;
+    const uint row_u = row_base + tid % Wr;
+    const bool row_ok = row_u < p.neq1;
+    const uint pos_row = min(row_u, p.neq1 - 1) * p.nbp1 + batch * p.nbp3;
+    const uint t0 = gl_WorkGroupID.x * 32;
+    const uint t_end = min(t0 + 32, loop_count);
+    for (uint t = t0 + tid / Wr; t < t_end; t += phases) {
+        bool live = false;
+        bool nonu = false;
+        if (row_ok) {
+            const uint c0 = t * Bc;
+            if (Unaligned != 0) {
+                for (uint idx = 0; idx < Bc; ++idx) {
+                    const uint c = c0 + idx;
+                    if (c < p.nek1) {
+                        const int d = data_pos[pos_row + c];
+                        live = live || d != p.masked_pos;
+                        nonu = nonu || d != u_pos;
+                    } else {
+                        nonu = true;
+                    }
+                }
+            } else {
+                [[unroll]] for (uint idx = 0; idx < Bc / 4; ++idx) {
+                    const ivec4 d = data_posv4[(pos_row + c0) / 4 + idx];
+                    live = live || any(notEqual(d, ivec4(p.masked_pos)));
+                    nonu = nonu || any(notEqual(d, ivec4(u_pos)));
+                }
+            }
+        }
+        live = subgroupAny(live);
+        nonu = subgroupAny(nonu);
+        if (live && gl_SubgroupInvocationID == 0) {
+            atomicOr(sh_bits[0], 1u << (t - t0));
+        }
+        if (nonu && gl_SubgroupInvocationID == 0) {
+            atomicOr(sh_bits[1], 1u << (t - t0));
+        }
+    }
+    barrier();
+    if (tid < 2) {
+        data_tl[((batch * gl_NumWorkGroups.y + gl_WorkGroupID.y) * 2 + tid) * n_words + gl_WorkGroupID.x] = sh_bits[tid];
+    }
+}

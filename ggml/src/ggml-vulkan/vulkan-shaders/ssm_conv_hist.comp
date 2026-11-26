@@ -1,0 +1,68 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// ssm_conv over the window [past | x^T] read in place (no concatenated copy), and the last nc - 1 columns of
+// the window written to the recurrent state (store slot k, written by the threads of token k: the history after
+// token n_t - 1 - k, the rollback snapshots). The sum is the one of ssm_conv.comp (dot for nc == 4, else a loop).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Past  { float past[]; };
+layout(binding = 1) readonly  buffer Src   { float src[]; };
+layout(binding = 2) readonly  buffer Taps  { float taps[]; };
+layout(binding = 3) writeonly buffer Store { float store[]; };
+layout(binding = 4) writeonly buffer Dst   { float dst[]; };
+
+// strides in elements; o* are the misalignments of the bindings in elements
+layout(push_constant) uniform PushConstants {
+    uint nbp1; uint nbp2;
+    uint nbx1; uint nbx2;
+    uint nbc1;
+    uint nbs1; uint nbs2;
+    uint nbd1; uint nbd2;
+    uint nc; uint nr; uint n_t; uint n_s;
+    uint has_store;
+    uint op; uint ox; uint oc; uint os; uint od;
+    uint nbs3;
+};
+
+float win(const uint i3, const uint i1, const uint col) {
+    if (col < nc - 1) {
+        return past[op + i3*nbp2 + i1*nbp1 + col];
+    }
+    return src[ox + i3*nbx2 + (col - (nc - 1))*nbx1 + i1];
+}
+
+void main() {
+    const uint i1 = gl_GlobalInvocationID.x; // channel
+    const uint i2 = gl_WorkGroupID.y;        // token
+    const uint i3 = gl_WorkGroupID.z;        // sequence
+
+    if (i1 >= nr || i2 >= n_t || i3 >= n_s) {
+        return;
+    }
+
+    const uint c_base = oc + i1*nbc1;
+
+    float sum = 0.0;
+
+    if (nc == 4) {
+        sum = dot(
+            vec4(win(i3, i1, i2), win(i3, i1, i2 + 1), win(i3, i1, i2 + 2), win(i3, i1, i2 + 3)),
+            vec4(taps[c_base], taps[c_base + 1], taps[c_base + 2], taps[c_base + 3])
+        );
+    } else {
+        [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
+            sum += win(i3, i1, i2 + i0) * taps[c_base + i0];
+        }
+    }
+
+    dst[od + i3*nbd2 + i2*nbd1 + i1] = sum;
+
+    if (i2 < has_store) {
+        for (uint j = 0; j < nc - 1; j++) {
+            store[os + i2*nbs3 + i3*nbs2 + i1*nbs1 + j] = win(i3, i1, n_t - i2 + j);
+        }
+    }
+}

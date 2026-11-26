@@ -1,0 +1,35 @@
+#version 450
+
+#include "glu_head.glsl"
+
+// situ(a, b) = beta*tanh(a/beta)*sigmoid(a) * lb*tanh(b/lb)
+// p.alpha = beta, p.limit = lb, p.param3 = 1/beta, p.param4 = 1/lb (b passes through when lb <= 0).
+// Same expressions and order as the unfused SCALE, TANH, SCALE, SIGMOID, MUL chain in unary.comp/scale.comp.
+// The values that the unfused chain stored to memory are marked precise so the compiler cannot
+// reassociate or contract across those former op boundaries; the results then match bit for bit.
+
+float situ_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+float situ_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+float op(float a, float b) {
+    precise float s   = a * p.param3;
+    precise float t   = situ_tanh(s);
+    precise float act = t * p.alpha;
+    precise float sig = situ_sigmoid(a);
+    precise float g   = act * sig;
+    precise float up  = b;
+    if (p.limit > 0.0f) {
+        precise float u  = b * p.param4;
+        precise float tu = situ_tanh(u);
+        up = tu * p.limit;
+    }
+    precise float r = g * up;
+    return r;
+}
+
+#include "glu_main.glsl"

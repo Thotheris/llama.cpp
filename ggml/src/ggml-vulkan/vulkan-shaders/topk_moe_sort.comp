@@ -1,0 +1,139 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+
+// Fused MoE router for sigmoid gating with a selection bias and an additive eps on the
+// weight sum (e.g. Inkling):
+//   probs  = sigmoid(logits); sel = probs + bias
+//   ids    = argsort(sel, desc)[:n_used]
+//   w      = probs[ids]; w = w / (sum(w)*eps_scale + eps_bias); w = w*out_scale + out_bias
+// It reproduces the unfused Vulkan chain bit for bit: the same bitonic network as
+// argsort.comp (so tied values come out in the same order), the shared-memory tree of
+// sum_rows.comp, a true division as in div.comp and the expressions of scale.comp.
+// One workgroup of BLOCK_SIZE = next_pow2(n_experts) invocations per row.
+
+layout(constant_id = 0) const int BLOCK_SIZE = 128;
+layout(constant_id = 1) const int NCOLS_PADDED_LOG2 = 7;
+layout(constant_id = 2) const int SUM_BLOCK = 32;   // sum_rows workgroup size (device subgroup size)
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Logits {float logits[];};
+layout (binding = 1) readonly buffer Bias {float bias[];};
+layout (binding = 2) writeonly buffer Weights {float weights[];};
+layout (binding = 3) writeonly buffer Ids {int ids[];};
+
+layout (push_constant) uniform parameter {
+    uint n_experts;
+    uint n_expert_used;
+    uint n_rows;
+    uint ids_stride;
+    float eps_scale;
+    float eps_bias;
+    float out_scale;
+    float out_bias;
+} p;
+
+shared ivec2 dst_row[BLOCK_SIZE];
+shared float probs_sh[BLOCK_SIZE];
+shared float w_sh[BLOCK_SIZE];
+shared float tmp[SUM_BLOCK];
+
+float op_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+// scale.comp: x * param1 + param2
+float op_scale(float x, float s, float b) {
+    return x * s + b;
+}
+
+void route(const uint row) {
+    const int col = int(gl_LocalInvocationID.x);
+    const uint row_offset = row * p.n_experts;
+
+    ivec2 value = ivec2(col, 0);
+    if (col < p.n_experts) {
+        const float pr = op_sigmoid(logits[row_offset + col]);
+        probs_sh[col] = pr;
+        value.y = floatBitsToInt(pr + bias[col]);
+    }
+    dst_row[col] = value;
+    barrier();
+
+    // bitonic sort, identical to argsort.comp (ascending)
+    uint num_outer_loop_iters = NCOLS_PADDED_LOG2;
+    [[unroll]] for (uint k = 2, outer_idx = 0; outer_idx < num_outer_loop_iters; k *= 2, outer_idx++) {
+        uint num_inner_loop_iters = outer_idx + 1;
+        [[unroll]] for (uint j = k / 2, inner_idx = 0; inner_idx < num_inner_loop_iters; j /= 2, inner_idx++) {
+            const int ixj = int(col ^ j);
+
+            if (ixj > col) {
+                int idx_0 = (col & k) == 0 ? col : ixj;
+                int idx_1 = (col & k) == 0 ? ixj : col;
+
+                ivec2 sh_idx_0 = dst_row[idx_0];
+                ivec2 sh_idx_1 = dst_row[idx_1];
+                bool idx_0_oob = sh_idx_0.x >= p.n_experts;
+                bool idx_1_oob = sh_idx_1.x >= p.n_experts;
+
+                if (idx_0_oob ||
+                    (!idx_1_oob && intBitsToFloat(sh_idx_0.y) > intBitsToFloat(sh_idx_1.y))) {
+                    dst_row[idx_0] = sh_idx_1;
+                    dst_row[idx_1] = sh_idx_0;
+                }
+            }
+
+            barrier();
+        }
+    }
+
+    // descending order: position kk of the output is dst_row[n_experts - 1 - kk]
+    if (col < p.n_expert_used) {
+        const int e = dst_row[p.n_experts - 1 - col].x;
+        ids[row * p.ids_stride + col] = e;
+        w_sh[col] = probs_sh[e];
+    }
+    barrier();
+
+    // sum_rows.comp
+    float wsum;
+    if (p.n_expert_used <= 4) {
+        wsum = 0.0f;
+        for (uint i = 0; i < p.n_expert_used; ++i) {
+            wsum += w_sh[i];
+        }
+    } else {
+        if (col < SUM_BLOCK) {
+            tmp[col] = 0.0f;
+            for (uint i = col; i < p.n_expert_used; i += SUM_BLOCK) {
+                tmp[col] += w_sh[i];
+            }
+        }
+        barrier();
+        [[unroll]] for (int s = SUM_BLOCK / 2; s > 0; s >>= 1) {
+            if (col < s) {
+                tmp[col] += tmp[col + s];
+            }
+            barrier();
+        }
+        wsum = tmp[0];
+    }
+
+    if (col < p.n_expert_used) {
+        const float denom = op_scale(wsum, p.eps_scale, p.eps_bias);
+        const float w = w_sh[col] / denom;
+        weights[row * p.n_expert_used + col] = op_scale(w, p.out_scale, p.out_bias);
+    }
+    barrier();
+}
+
+void main() {
+    uint row = gl_WorkGroupID.y;
+    while (row < p.n_rows) {
+        route(row);
+        row += gl_NumWorkGroups.y;
+    }
+}

@@ -5,7 +5,45 @@
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
+void get_elements() {
+    // rows of one element (a take along dim 1): x walks the indices, so that a workgroup is not one invocation
+    // indices broadcast over dim 2 (zero stride) are read once for all i12
+    const bool bcast = p.nb12 == 0;
+
+    uint gid_z = gl_GlobalInvocationID.z;
+    while (gid_z < (bcast ? p.ne11 : p.ne11 * p.ne12)) {
+        const uint i11    = bcast ? gid_z : gid_z / p.ne12;
+        const uint i12_0  = bcast ? 0     : gid_z % p.ne12;
+        const uint i12_1  = bcast ? p.ne12 : i12_0 + 1;
+
+        uint i10 = gl_GlobalInvocationID.x;
+        while (i10 < p.ne10) {
+            const uint i01 = data_b[get_boffset() + i10*p.nb10 + i11*p.nb11 + i12_0*p.nb12];
+
+            for (uint i12 = i12_0; i12 < i12_1; ++i12) {
+                const uint a_offset = get_aoffset() + i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
+                const uint d_offset = get_doffset() + i10*p.nb21 + i11*p.nb22 + i12*p.nb23;
+
+#if defined(DATA_A_BF16)
+                TEMP_TYPE v = TEMP_TYPE(bf16_to_fp32(data_a[a_offset]));
+#else
+                TEMP_TYPE v = TEMP_TYPE(data_a[a_offset]);
+#endif
+                data_d[d_offset] = D_TYPE(v);
+            }
+
+            i10 += gl_WorkGroupSize.x * gl_NumWorkGroups.x;
+        }
+        gid_z += gl_WorkGroupSize.z * gl_NumWorkGroups.z;
+    }
+}
+
 void main() {
+    if (p.ne00 == 1) {
+        get_elements();
+        return;
+    }
+
     const uint i00 = gl_GlobalInvocationID.x;
 
     if (i00 >= p.ne00) {

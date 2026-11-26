@@ -1,0 +1,173 @@
+#version 450
+
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// The relative-position attention bias gathered into a mask, see ggml_rel_bias:
+//   v = [l2_clip(r[:, h, i], s[:, h])*tau[i]; t[h, i]; 1],  y[j, i % n_tps, h, i / n_tps] = dot(table[:, pos[j, i]], v)
+// for n_rel == N_REL (16).
+// Workgroup (x: 2*128 kv cells, y: token i, z: group of hg heads). The first hg invocations clip the r of the
+// group's heads into shared memory, then each invocation reads the table columns of its two cells once and
+// writes the two cells of the hg heads.
+// The clip is the one of l2_clip.comp (the same halving tree: its BLOCK_SIZE >= N_REL only adds zeros on top,
+// the same precise values).
+// With F16_INPUTS the dot rounds its inputs as the f32 matmul of the unfused chain does on fp16 devices (it stores
+// both as f16), so the products are exact and only the order of the f32 sum differs (the coopmat sum is not
+// reproducible); the sum is in k order.
+
+#define N_REL 16
+#define NV    (N_REL + 2)
+#define NV4   ((NV + 3)/4)
+#define MAX_HG 32
+#define WG    128
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer R  {float   data_r[];};
+layout (binding = 1) readonly  buffer S  {float   data_s[];};
+layout (binding = 2) readonly  buffer T  {float   data_t[];};
+layout (binding = 3) readonly  buffer U  {float   data_u[];};
+layout (binding = 4) readonly  buffer C  {float   data_c[];};
+layout (binding = 5) readonly  buffer P  {int     data_p[];};
+layout (binding = 6) writeonly buffer D  {D_TYPE  data_d[];};
+#if defined(D_TYPEV2)
+layout (binding = 6) writeonly buffer D2 {D_TYPEV2 data_d2[];};
+#endif
+
+// vk_op_rel_bias_push_constants
+layout (push_constant) uniform parameter
+{
+    uint n_rel, n_head, n_kv, n_tps, hg;
+    uint nbr1, nbr2, nbs1, nbt1, nbt2, nbu2, nbc1, nbp1, nbd1, nbd2, nbd3;
+    uint has_scale, has_tau, pairs;
+    float threshold;
+    uint o_r, o_s, o_t, o_u, o_c, o_p, o_d;
+    uint has_pos;
+} p;
+
+shared vec4 sv[MAX_HG*NV4];
+
+// x rounded to the nearest f16 (ties to even) and back, in integer arithmetic (the driver folds a
+// float(float16_t(x)) round trip away)
+float round_in(const float x) {
+#if defined(F16_INPUTS)
+    const uint u = floatBitsToUint(x);
+    const uint e = (u >> 23) & 0xFFu;
+    // f16 normal range (or overflow): keep 10 mantissa bits
+    uint v = (u + 0xFFFu + ((u >> 13) & 1u)) & ~0x1FFFu;
+    v = ((v >> 23) & 0xFFu) > 142u ? ((u & 0x80000000u) | 0x7F800000u) : v;
+    // f16 subnormals: multiples of 2^-24 (the scalings are exact)
+    const float sub = roundEven(x * 16777216.0f) * (1.0f/16777216.0f);
+    return e == 0xFFu ? x : (e >= 113u ? uintBitsToFloat(v) : sub);
+#else
+    return x;
+#endif
+}
+
+void main() {
+    const uint i   = gl_WorkGroupID.y;
+    const uint h0  = gl_WorkGroupID.z*p.hg;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (tid < p.hg) {
+        const uint h  = h0 + tid;
+        const uint rb = p.o_r + h*p.nbr1 + i*p.nbr2;
+        const uint sb = p.o_s + h*p.nbs1;
+        const bool has_scale = p.has_scale != 0;
+
+        float x[N_REL];
+        float sq[N_REL];
+        [[unroll]] for (uint k = 0; k < N_REL; ++k) {
+            precise float xk = data_r[rb + k];
+            if (has_scale) {
+                xk = xk * data_s[sb + k];
+            }
+            x[k] = xk;
+            precise float q = xk * xk;
+            sq[k] = q;
+        }
+        [[unroll]] for (uint s = N_REL/2; s > 0; s >>= 1) {
+            [[unroll]] for (uint k = 0; k < s; ++k) {
+                precise float a = sq[k] + sq[k + s];
+                sq[k] = a;
+            }
+        }
+
+        precise float norm = sqrt(sq[0]);
+        norm = norm + 1e-6f;
+        float factor = p.threshold / norm;
+        factor = clamp(factor, 0.0f, 1.0f);
+
+        const bool  has_tau = p.has_tau != 0;
+        const float tau     = has_tau ? data_u[p.o_u + i*p.nbu2] : 1.0f;
+
+        float y[NV4*4];
+        [[unroll]] for (uint k = 0; k < N_REL; ++k) {
+            precise float yk = x[k] * factor;
+            if (has_tau) {
+                yk = yk * tau;
+            }
+            y[k] = round_in(yk);
+        }
+        y[N_REL]     = round_in(data_t[p.o_t + h*p.nbt1 + i*p.nbt2]);
+        y[N_REL + 1] = 1.0f;
+        [[unroll]] for (uint k = NV; k < NV4*4; ++k) {
+            y[k] = 0.0f;
+        }
+        [[unroll]] for (uint k = 0; k < NV4; ++k) {
+            sv[tid*NV4 + k] = vec4(y[4*k], y[4*k + 1], y[4*k + 2], y[4*k + 3]);
+        }
+    }
+
+    barrier();
+
+    // two cells per invocation
+    const uint j0 = 2*gl_GlobalInvocationID.x;
+    if (j0 >= p.n_kv) {
+        return;
+    }
+    const bool has1 = j0 + 1 < p.n_kv;
+
+    const uint pb = p.o_p + i*p.nbp1;
+    // without pos every table column: d = j
+    const bool has_pos = p.has_pos != 0;
+    const uint d0 = has_pos ? uint(data_p[pb + j0]) : j0;
+    const uint d1 = has1 ? (has_pos ? uint(data_p[pb + j0 + 1]) : j0 + 1) : d0;
+
+    float c0[NV];
+    float c1[NV];
+    [[unroll]] for (uint k = 0; k < NV; ++k) {
+        c0[k] = round_in(data_c[p.o_c + d0*p.nbc1 + k]);
+        c1[k] = round_in(data_c[p.o_c + d1*p.nbc1 + k]);
+    }
+
+    const uint ti = i % p.n_tps;
+    const uint si = i / p.n_tps;
+    const uint db = p.o_d + j0 + ti*p.nbd1 + si*p.nbd3;
+
+    for (uint hh = 0; hh < p.hg; ++hh) {
+        float v[NV4*4];
+        [[unroll]] for (uint k = 0; k < NV4; ++k) {
+            const vec4 w = sv[hh*NV4 + k];
+            v[4*k] = w.x; v[4*k + 1] = w.y; v[4*k + 2] = w.z; v[4*k + 3] = w.w;
+        }
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        [[unroll]] for (uint k = 0; k < NV; ++k) {
+            a0 = fma(c0[k], v[k], a0);
+            a1 = fma(c1[k], v[k], a1);
+        }
+        const uint o = db + (h0 + hh)*p.nbd2;
+#if defined(D_TYPEV2)
+        if (p.pairs != 0) {
+            data_d2[o/2] = D_TYPEV2(vec2(a0, a1));
+            continue;
+        }
+#endif
+        data_d[o] = D_TYPE(a0);
+        if (has1) {
+            data_d[o + 1] = D_TYPE(a1);
+        }
+    }
+}

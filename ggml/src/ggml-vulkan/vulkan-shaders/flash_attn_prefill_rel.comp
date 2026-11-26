@@ -1,0 +1,446 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shared_memory_block : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+
+// Prefill flash attention for Intel Xe2 (SIMD16, 8x16x16 cooperative matrices) with the rel-pos bias of
+// ggml_flash_attn_ext_set_rel_bias: head size 128, F16 K/V, F32 Q/O.
+//
+// A workgroup owns Wr = 64 query rows of one head: 16 subgroups, subgroup sg holds the rows rb = sg % 4 (16 rows, one
+// per lane) and dh = sg / 4, which picks both the 8 cells of the Bc = 32 cell tile whose scores the subgroup computes
+// and the 32 output columns of the 128 it accumulates. The scores of a (row block, tile) are computed once:
+//   S^T (8 x 16) = K (8 x 128) * Q^T (128 x 16)     accumulator lane = query row, element = kv cell
+// the four subgroups of a row block exchange their partial row max through shared memory (each then knows the max of
+// the whole tile), write their P (F16) to shared memory, and each reads P of all the tile's cells back as B matrices:
+//   O^T (32 x 16) += V^T (32 x Bc) * P^T (Bc x 16)  element i of a B matrix is cell i of the row of the lane
+// The row sum is kept per subgroup (over its own cells, with the common max) and summed at the end.
+// Q (scaled, F16) stays in shared memory for the whole loop.
+//
+// Shared memory (30 KiB at Wr 64, Bc 32; more than 32 KiB halves the workgroups per Xe core):
+//   Q [8 d-chunks][Wr rows][16], read as B matrices (column major, two 16-byte loads per lane)
+//   the K tile, then (once the scores are done) the V^T tile, as 8x16 A matrices stored in lane order, so each lane reads
+//     its 8 halfs with one 16-byte load: lane l, dword g of an A matrix holds the elements (row 2 g + l / 8, columns
+//     2 (l % 8) + {0, 1}) (coopMatLoad of an A matrix from shared memory is four 4-byte messages per lane on this driver)
+//   P of the tile [Wr rows][Bc + 8] (F16), and the partial row max / sum [Wr rows][4] (F32)
+// Each lane gathers the bias of its row and its subgroup's 8 cells (-inf where masked) straight into registers.
+// The tile flags come from flash_attn_rel_tiles.comp (computed once per row block for all the heads) and are kept in
+// registers: a dead tile (no row of the workgroup sees any of its cells) is skipped; a uniform tile (every pos of its
+// cells in every row of the block is u_pos, the pos of the first cell of the first row: the far cells of a full
+// attention at depth) takes the bias of u_pos, read once per lane before the loop, instead of gathering it.
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Q {float data_q[];};
+layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
+layout (binding = 1) readonly buffer KU {uint data_ku[];};
+layout (binding = 2) readonly buffer VU4 {uvec4 data_vu4[];};
+// the live and non-uniform tile bits of the row blocks (flash_attn_rel_tiles.comp)
+layout (binding = 3) readonly buffer TL {uint data_tl[];};
+layout (binding = 4) readonly buffer S {float data_s[];};
+layout (binding = 5) writeonly buffer OV4 {vec4 data_ov4[];};
+layout (binding = 6) readonly buffer POS {int data_pos[];};
+layout (binding = 6) readonly buffer POSV4 {ivec4 data_posv4[];};
+layout (binding = 7) readonly buffer BIAS {float16_t data_b[];};
+
+layout (push_constant) uniform parameter
+{
+    uint neq1;
+    uint neq2;
+    uint neq3;
+    uint nek1;
+    uint nek2;
+    uint nek3;
+    uint nev2;
+    uint nev3;
+    uint nem1;
+    uint nem2;
+    uint nem3;
+    uint nbq1;
+    uint nbq2;
+    uint nbk1;
+    uint nbk2;
+    uint nbv1;
+    uint nbv2;
+    uint nbq3;
+    uint nbk3;
+    uint nbv3;
+    uint nb3;
+    uint flag;
+    float scale;
+    uint nbp1;
+    uint nbp3;
+    uint nbb1;
+    uint nbb2;
+    uint nbb3;
+    uint neb2;
+    int  masked_pos;
+} p;
+
+layout (constant_id = 0) const uint WorkGroupSize = 256;
+layout (constant_id = 1) const uint Wr = 64;
+layout (constant_id = 2) const uint Bc = 32;
+layout (constant_id = 3) const uint Flags = 0;
+// unused
+layout (constant_id = 4) const uint KS = 16;
+
+#define UNALIGNED_SEQ_LEN_BIT (1 << 0)
+#define UNALIGNED_Q_STRIDE_BIT (1 << 1)
+#define SINK_ENABLE_BIT (1 << 16)
+
+const bool aligned_q_stride = (Flags & UNALIGNED_Q_STRIDE_BIT) == 0;
+const bool seq_boundary_check = (Flags & UNALIGNED_SEQ_LEN_BIT) != 0;
+
+const uint SG = 16;
+const uint TM = 8;
+const uint TN = 16;
+const uint TK = 16;
+const uint D = 128;
+const uint sg_count = WorkGroupSize / SG;
+const uint row_blocks = Wr / TN;
+const uint d_split = sg_count / row_blocks;
+const uint DS = D / d_split;
+const uint OA_N = DS / TM;
+const uint DC = D / TK;
+
+const uint qsh_halfs = DC * Wr * TK;
+// the K tile (lane-order A matrices), then the V^T tile of the same cells in the same space
+const uint ksh_base = qsh_halfs;
+const uint ksh_halfs = DC * Bc * TK;
+const uint vsh_base = ksh_base;
+const uint vsh_halfs = (Bc / TK) * D * TK;
+const uint kvsh_halfs = ksh_halfs > vsh_halfs ? ksh_halfs : vsh_halfs;
+// P of the tile [Wr rows][Bc + 8] (F16)
+const uint PSTR = Bc + 8;
+const uint psh_base = ksh_base + kvsh_halfs;
+const uint psh_halfs = Wr * PSTR;
+// the partial row max (then the partial row sum) of each subgroup: [Wr rows][d_split] floats
+const uint xsh_base = psh_base + psh_halfs;
+const uint xsh_halfs = Wr * d_split * 2;
+const uint sh_halfs = xsh_base + xsh_halfs;
+// the V tile in rounds of 16-byte row pairs
+const uint V_IT = (Bc / 2 * D / 8 + WorkGroupSize - 1) / WorkGroupSize;
+const bool V_PART = (Bc / 2 * D / 8) % WorkGroupSize != 0;
+// kv cells of the scores of one subgroup (one 8-row accumulator)
+const uint SC = Bc / d_split;
+
+shared sh_f16 {
+    float16_t F16sh[sh_halfs];
+} F16P;
+
+shared sh_f16v4 {
+    f16vec4 F16V4sh[sh_halfs / 4];
+} F16V4P;
+
+shared sh_u32 {
+    uint U32sh[sh_halfs / 2];
+} U32P;
+
+shared sh_f32 {
+    float F32sh[sh_halfs / 2];
+} F32P;
+
+shared sh_u4 {
+    uvec4 U4sh[sh_halfs / 8];
+} U4P;
+
+shared sh_v4 {
+    vec4 V4sh[sh_halfs / 8];
+} V4P;
+
+// the tile flags of flash_attn_rel_tiles.comp are read in chunks of live_chunk tiles: lane l of every subgroup holds
+// the words l, 16 + l, 32 + l, 48 + l of the chunk
+const uint live_words = 64;
+const uint live_chunk = live_words * 32;
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint rb = sg % row_blocks;
+    const uint dh = sg / row_blocks;
+
+    const uint head_q = gl_WorkGroupID.x;
+    const uint head_k = head_q / (p.neq2 / p.nek2);
+    const uint head_v = head_q / (p.neq2 / p.nev2);
+    const uint batch = gl_WorkGroupID.z;
+    const uint batch_k = batch / (p.neq3 / p.nek3);
+    const uint batch_v = batch / (p.neq3 / p.nev3);
+    // causal prefill: the last row blocks see the most cells; dispatch them first
+    const uint out_r = gl_NumWorkGroups.y - 1 - gl_WorkGroupID.y;
+    const uint row0 = out_r * Wr;
+
+    // Q * scale -> F16 blocks [d / 16][row][d % 16]
+    if (aligned_q_stride) {
+        [[unroll]] for (uint it = 0; it < Wr * D / 4 / WorkGroupSize; ++it) {
+            const uint f = it * WorkGroupSize + tid;
+            const uint q = f / (D / 4);
+            const uint d = (f % (D / 4)) * 4;
+            const uint row = min(row0 + q, p.neq1 - 1);
+            const vec4 v = data_qv4[(row * p.nbq1 + head_q * p.nbq2 + batch * p.nbq3) / 4 + d / 4] * p.scale;
+            F16V4P.F16V4sh[(((d / TK) * Wr + q) * TK + d % TK) / 4] = f16vec4(v);
+        }
+    } else {
+        [[unroll]] for (uint it = 0; it < Wr * D / WorkGroupSize; ++it) {
+            const uint f = it * WorkGroupSize + tid;
+            const uint q = f / D;
+            const uint d = f % D;
+            const uint row = min(row0 + q, p.neq1 - 1);
+            const float v = data_q[row * p.nbq1 + head_q * p.nbq2 + batch * p.nbq3 + d] * p.scale;
+            F16P.F16sh[((d / TK) * Wr + q) * TK + d % TK] = float16_t(v);
+        }
+    }
+
+    const uint loop_count = (p.nek1 + Bc - 1) / Bc;
+
+    // (the barrier before the first K tile store publishes Q)
+    // the pos of the uniform tiles: the pos of the first cell in the first row of the block
+    const int u_pos = data_pos[min(row0, p.neq1 - 1) * p.nbp1 + batch * p.nbp3];
+    const uint n_words = (loop_count + 31) / 32;
+    const uint tl_live = (batch * gl_NumWorkGroups.y + out_r) * 2 * n_words;
+    const uint tl_nonu = tl_live + n_words;
+#define LOAD_TL(cw0) \
+    lb0 = cw0 + 0 * SG + lane < n_words ? data_tl[tl_live + cw0 + 0 * SG + lane] : 0; \
+    lb1 = cw0 + 1 * SG + lane < n_words ? data_tl[tl_live + cw0 + 1 * SG + lane] : 0; \
+    lb2 = cw0 + 2 * SG + lane < n_words ? data_tl[tl_live + cw0 + 2 * SG + lane] : 0; \
+    lb3 = cw0 + 3 * SG + lane < n_words ? data_tl[tl_live + cw0 + 3 * SG + lane] : 0; \
+    nb0 = cw0 + 0 * SG + lane < n_words ? data_tl[tl_nonu + cw0 + 0 * SG + lane] : ~0u; \
+    nb1 = cw0 + 1 * SG + lane < n_words ? data_tl[tl_nonu + cw0 + 1 * SG + lane] : ~0u; \
+    nb2 = cw0 + 2 * SG + lane < n_words ? data_tl[tl_nonu + cw0 + 2 * SG + lane] : ~0u; \
+    nb3 = cw0 + 3 * SG + lane < n_words ? data_tl[tl_nonu + cw0 + 3 * SG + lane] : ~0u;
+    uint lb0, lb1, lb2, lb3, nb0, nb1, nb2, nb3;
+    LOAD_TL(0)
+
+    // the row of the lane (rows past neq1 compute a copy of the last one and are not stored)
+    const uint row_u = row0 + rb * TN + lane;
+
+    const uint k_base = batch_k * p.nbk3 + head_k * p.nbk2;
+    const uint v_base = batch_v * p.nbv3 + head_v * p.nbv2;
+
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+    const float NEG_INF = uintBitsToFloat(0xFF800000);
+
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> OA[OA_N];
+    [[unroll]] for (uint j = 0; j < OA_N; ++j) {
+        OA[j] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+    }
+    float Mf = NEG_FLT_MAX_OVER_2;
+    float Lf = 0.0f;
+
+    // the row of the lane (for the bias gather)
+    const uint row_c = min(row_u, p.neq1 - 1);
+    const uint pos_row_l = row_c * p.nbp1 + batch * p.nbp3;
+    const uint b_row_l = row_c * p.nbb1 + (head_q % max(p.neb2, 1u)) * p.nbb2 + batch * p.nbb3;
+    // the bias of the uniform tiles
+    const float16_t b_uni = data_b[b_row_l + u_pos];
+
+    for (uint loop = 0; loop < loop_count; ++loop) {
+        if (loop > 0 && loop % live_chunk == 0) {
+            LOAD_TL(loop / 32)
+        }
+        bool uni;
+        {
+            // a tile whose cells are all masked adds nothing: skip it (uniform over the workgroup)
+            const uint tl = loop % live_chunk;
+            const uint w = tl / 32;
+            uint wv = w < 16 ? lb0 : (w < 32 ? lb1 : (w < 48 ? lb2 : lb3));
+            wv = subgroupShuffle(wv, w % SG);
+            if ((wv & (1u << (tl % 32))) == 0) {
+                continue;
+            }
+            uint nv = w < 16 ? nb0 : (w < 32 ? nb1 : (w < 48 ? nb2 : nb3));
+            nv = subgroupShuffle(nv, w % SG);
+            uni = (nv & (1u << (tl % 32))) == 0;
+        }
+        const uint c0 = loop * Bc;
+
+        // K: invocation f gathers the 4 dwords of lane f % 16 of the A matrix f / 16 = (8-row block pc, 16-column chunk dc)
+        uvec4 kr[Bc * D / 8 / WorkGroupSize];
+        [[unroll]] for (uint it = 0; it < Bc * D / 8 / WorkGroupSize; ++it) {
+            const uint f = it * WorkGroupSize + tid;
+            const uint l = f % 16;
+            const uint pc = (f / 16) / DC;
+            const uint dc = (f / 16) % DC;
+            [[unroll]] for (uint g = 0; g < 4; ++g) {
+                const uint kv = c0 + pc * TM + 2 * g + l / 8;
+                if (seq_boundary_check && kv >= p.nek1) {
+                    kr[it][g] = 0;
+                } else {
+                    kr[it][g] = data_ku[(k_base + kv * p.nbk1) / 2 + dc * 8 + l % 8];
+                }
+            }
+        }
+        // V: invocation f loads the rows 2 * (f % (Bc / 2)) + {0, 1} of the 8 columns f / (Bc / 2) of d
+        uvec4 va[V_IT], vb[V_IT];
+        [[unroll]] for (uint vr = 0; vr < V_IT; ++vr) {
+            const uint f = vr * WorkGroupSize + tid;
+            const uint kv = c0 + 2 * (f % (Bc / 2));
+            const uint vd8 = f / (Bc / 2);
+            if ((seq_boundary_check && kv >= p.nek1) || (V_PART && vd8 >= D / 8)) {
+                va[vr] = uvec4(0);
+            } else {
+                va[vr] = data_vu4[(v_base + kv * p.nbv1) / 8 + vd8];
+            }
+            if ((seq_boundary_check && kv + 1 >= p.nek1) || (V_PART && vd8 >= D / 8)) {
+                vb[vr] = uvec4(0);
+            } else {
+                vb[vr] = data_vu4[(v_base + (kv + 1) * p.nbv1) / 8 + vd8];
+            }
+        }
+
+        // the bias of the SC cells of the subgroup in the row of the lane (masked cells: -inf)
+        const uint cs0 = c0 + dh * SC;
+        float16_t bl[SC];
+        if (uni) {
+            [[unroll]] for (uint e = 0; e < SC; ++e) {
+                bl[e] = b_uni;
+            }
+        } else if (seq_boundary_check) {
+            [[unroll]] for (uint e = 0; e < SC; ++e) {
+                const uint c = cs0 + e;
+                bl[e] = c < p.nek1 ? data_b[b_row_l + data_pos[pos_row_l + c]] : float16_t(NEG_INF);
+            }
+        } else {
+            [[unroll]] for (uint e4 = 0; e4 < SC / 4; ++e4) {
+                const ivec4 d = data_posv4[(pos_row_l + cs0) / 4 + e4];
+                bl[4 * e4 + 0] = data_b[b_row_l + d.x];
+                bl[4 * e4 + 1] = data_b[b_row_l + d.y];
+                bl[4 * e4 + 2] = data_b[b_row_l + d.z];
+                bl[4 * e4 + 3] = data_b[b_row_l + d.w];
+            }
+        }
+
+        // the V^T and P of the previous tile are no longer read
+        barrier();
+        [[unroll]] for (uint it = 0; it < Bc * D / 8 / WorkGroupSize; ++it) {
+            U4P.U4sh[ksh_base / 8 + it * WorkGroupSize + tid] = kr[it];
+        }
+        barrier();
+
+        // S^T of the SC cells dh * SC.. of the tile and the 16 rows of the row block: K * Q^T + bias
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> SA = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+        [[unroll]] for (uint dc = 0; dc < DC; ++dc) {
+            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> QB;
+            coopMatLoad(QB, F16P.F16sh, (dc * Wr + rb * TN) * TK, TK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> KA;
+            const uvec4 kw = U4P.U4sh[(ksh_base + (dh * DC + dc) * TM * TK) / 8 + lane];
+            [[unroll]] for (uint g = 0; g < 4; ++g) {
+                const f16vec2 h = unpackFloat2x16(kw[g]);
+                KA[2 * g] = h.x;
+                KA[2 * g + 1] = h.y;
+            }
+            SA = coopMatMulAdd(KA, QB, SA);
+        }
+        float mloc = NEG_FLT_MAX_OVER_2;
+        [[unroll]] for (uint e = 0; e < SC; ++e) {
+            SA[e] += float(bl[e]);
+            mloc = max(mloc, SA[e]);
+        }
+        F32P.F32sh[xsh_base / 2 + (rb * TN + lane) * d_split + dh] = mloc;
+        barrier();
+
+        // the K tile is no longer read: V^T into its space. The A matrix (vc, vd8) of V^T: lane l, dword g =
+        // (V[16 vc + 2 (l % 8) + {0, 1}][8 vd8 + 2 g + l / 8]); the rows pair 2 pr, 2 pr + 1 is lane pr % 8 (the even d)
+        // and lane 8 + pr % 8 (the odd d)
+        [[unroll]] for (uint vr = 0; vr < V_IT; ++vr) {
+            const uint f = vr * WorkGroupSize + tid;
+            const uint pr = f % (Bc / 2);
+            const uint vd8 = f / (Bc / 2);
+            const uint vc = (2 * pr) / TK;
+            if (!V_PART || vd8 < D / 8) {
+                const uint blk = (vsh_base + (vc * (D / 8) + vd8) * TM * TK) / 8;
+                U4P.U4sh[blk + pr % 8]     = (va[vr] & 0xFFFFu) | (vb[vr] << 16);
+                U4P.U4sh[blk + 8 + pr % 8] = (va[vr] >> 16) | (vb[vr] & 0xFFFF0000u);
+            }
+        }
+
+        // online softmax of the row of the lane: the max over the whole tile (the same in the d_split subgroups of the
+        // row block), the partial sum over the cells of the subgroup
+        const vec4 mx = V4P.V4sh[xsh_base / 8 + rb * TN + lane];
+        const float Mnew = max(Mf, max(max(mx.x, mx.y), max(mx.z, mx.w)));
+        const float eM = exp(Mf - Mnew);
+        Lf *= eM;
+        f16vec4 pv[SC / 4];
+        [[unroll]] for (uint e = 0; e < SC; ++e) {
+            const float pf = exp(SA[e] - Mnew);
+            Lf += pf;
+            pv[e / 4][e % 4] = float16_t(pf);
+        }
+        [[unroll]] for (uint e4 = 0; e4 < SC / 4; ++e4) {
+            F16V4P.F16V4sh[(psh_base + (rb * TN + lane) * PSTR + dh * SC) / 4 + e4] = pv[e4];
+        }
+
+        // rescale O (eM is exactly 1 where the max did not move)
+        if (subgroupAny(Mnew > Mf)) {
+            [[unroll]] for (uint j = 0; j < OA_N; ++j) {
+                [[unroll]] for (uint e = 0; e < TM; ++e) {
+                    OA[j][e] *= eM;
+                }
+            }
+        }
+        Mf = Mnew;
+        barrier();
+
+        // O^T += V^T * P^T: P^T as B matrices, element i of lane l = P[row l][16 c + i]
+        [[unroll]] for (uint c = 0; c < Bc / TK; ++c) {
+            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> PB;
+            const uvec4 p0 = U4P.U4sh[(psh_base + (rb * TN + lane) * PSTR + c * TK) / 8];
+            const uvec4 p1 = U4P.U4sh[(psh_base + (rb * TN + lane) * PSTR + c * TK) / 8 + 1];
+            [[unroll]] for (uint g = 0; g < 4; ++g) {
+                const f16vec2 h0 = unpackFloat2x16(p0[g]);
+                const f16vec2 h1 = unpackFloat2x16(p1[g]);
+                PB[2 * g] = h0.x;
+                PB[2 * g + 1] = h0.y;
+                PB[8 + 2 * g] = h1.x;
+                PB[8 + 2 * g + 1] = h1.y;
+            }
+            [[unroll]] for (uint j = 0; j < OA_N; ++j) {
+                coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> VA;
+                const uvec4 vw = U4P.U4sh[(vsh_base + (c * (D / 8) + (dh * DS + j * TM) / 8) * TM * TK) / 8 + lane];
+                [[unroll]] for (uint g = 0; g < 4; ++g) {
+                    const f16vec2 h = unpackFloat2x16(vw[g]);
+                    VA[2 * g] = h.x;
+                    VA[2 * g + 1] = h.y;
+                }
+                OA[j] = coopMatMulAdd(VA, PB, OA[j]);
+            }
+        }
+    }
+
+    // the row sum: the partial sums of the d_split subgroups of the row block, in a fixed order
+    barrier();
+    F32P.F32sh[xsh_base / 2 + (rb * TN + lane) * d_split + dh] = Lf;
+    barrier();
+    {
+        const vec4 ls = V4P.V4sh[xsh_base / 8 + rb * TN + lane];
+        Lf = ((ls.x + ls.y) + ls.z) + ls.w;
+    }
+
+    float Lfrcp;
+    if ((p.flag & SINK_ENABLE_BIT) != 0) {
+        const float sink = data_s[head_q];
+        float sink_emf = Mf - sink;
+        sink_emf = exp(sink_emf);
+        float Lf_sink = Lf * sink_emf;
+        float Lt = Lf + 1.0f / sink_emf;
+        Lt = 1.0f / Lt;
+        sink_emf /= (1.0f + Lf_sink);
+        Lfrcp = (Mf < sink) ? sink_emf : Lt;
+    } else {
+        Lfrcp = (Lf == 0.0f) ? 0.0f : (1.0f / Lf);
+    }
+
+    if (row_u < p.neq1) {
+        const uint o_base = (batch * p.nb3 + row_u * p.neq2 * D + head_q * D + dh * DS) / 4;
+        [[unroll]] for (uint j = 0; j < OA_N; ++j) {
+            data_ov4[o_base + 2 * j]     = vec4(OA[j][0], OA[j][1], OA[j][2], OA[j][3]) * Lfrcp;
+            data_ov4[o_base + 2 * j + 1] = vec4(OA[j][4], OA[j][5], OA[j][6], OA[j][7]) * Lfrcp;
+        }
+    }
+}

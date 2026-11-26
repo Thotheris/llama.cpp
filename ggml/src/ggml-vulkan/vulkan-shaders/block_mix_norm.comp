@@ -1,0 +1,315 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// block_mix.comp with the row RMS norms around it (ggml_block_mix_norm). Workgroup (0, q, t) handles query q of
+// token t and the whole output row:
+// - flag 1: the state cur is rms_norm(cur) of the raw cur, computed here;
+// - flag 2: y is replaced by rms_norm(y) (times the weight row when one is bound, flag 8);
+// - flag 4: the raw y is also written, to plane 1 of dst.
+// The scores, softmax and weighted sum are the ones of block_mix.comp. The two row norms follow rms_norm.comp with
+// its workgroup of RMS_BS threads (p.rms_bs, the host picks it as for the RMS_NORM op): a virtual rms thread v sums
+// the squares of the columns v, v + RMS_BS, ... in order, each subgroup of 16 virtual threads is summed by
+// subgroupAdd, the subgroup sums by the per-lane loop and a second subgroupAdd; then scale*x (times w) per element.
+// The subgroups of virtual threads are subgroups of this workgroup (the same lanes), so the sums are the ones of
+// the RMS_NORM op at the same subgroup size.
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 1024; // 64 subgroups (the host sets it)
+layout (constant_id = 1) const uint SG_SIZE = 16;     // the mul_mat_vec (and rms_norm) subgroup size
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer C {float data_c[];};
+layout (binding = 1) readonly buffer Q {float data_q[];};
+layout (binding = 2) readonly buffer S {float data_s[];};
+layout (binding = 3) readonly buffer W {float data_w[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+
+// vk_op_block_mix_push_constants
+layout (push_constant) uniform parameter
+{
+    uint ne0;
+    uint n_stack;
+    uint large;
+    uint chunk;
+    uint nbc2;
+    uint nbq1;
+    uint nbs1, nbs2;
+    uint nbd1, nbd2;
+    uint oc, oq, os, od;
+    float scale;
+    uint n_qw;
+    uint n_q;
+    uint vec4_strides;
+    // block_mix_norm.comp
+    uint flags;
+    float eps_in;
+    float eps_out;
+    uint nbw1;
+    uint ow;
+    uint nbd3;
+    uint rms_bs;
+    uint rms_sg;
+} p;
+
+#define MAX_STATES    16
+#define MAX_PER_GROUP 4 // MAX_STATES / (fewest dot groups = 4)
+#define MAX_NE0       4096
+#define MAX_RMS_SG    32 // 512 / 16
+// rms_norm.comp at subgroup size 32: a subgroupAdd of 32 lanes on Intel is the scan of the two 16-lane halves and
+// their sum, T(lanes 0..15) + T(lanes 16..31), with T the 16-lane subgroupAdd; the virtual subgroup s of 32 is the
+// pair of 16-lane subgroups 2s, 2s + 1 here
+
+shared float part[MAX_STATES][4];
+shared float dots[MAX_STATES];
+shared float ysh[MAX_NE0];
+shared float rms_sh[MAX_RMS_SG];
+shared float rms_res;
+
+float cur_scale = 1.0f;
+
+vec4 load_state4(const uint k, const uint t, const uint e) {
+    if (k < p.n_stack) {
+        const uint i = p.os + t*p.nbs2 + k*p.nbs1 + e;
+        return vec4(data_s[i], data_s[i + 1], data_s[i + 2], data_s[i + 3]);
+    }
+    const uint i = p.oc + t*p.nbc2 + e;
+    if ((p.flags & 1) != 0) {
+        precise vec4 v = cur_scale * vec4(data_c[i], data_c[i + 1], data_c[i + 2], data_c[i + 3]);
+        return v;
+    }
+    return vec4(data_c[i], data_c[i + 1], data_c[i + 2], data_c[i + 3]);
+}
+
+float load_state(const uint k, const uint t, const uint e) {
+    if (k < p.n_stack) {
+        return data_s[p.os + t*p.nbs2 + k*p.nbs1 + e];
+    }
+    if ((p.flags & 1) != 0) {
+        precise float v = cur_scale * data_c[p.oc + t*p.nbc2 + e];
+        return v;
+    }
+    return data_c[p.oc + t*p.nbc2 + e];
+}
+
+vec4 load_query4(const uint qoff, const uint col) {
+    return vec4(data_q[qoff + col], data_q[qoff + col + 1], data_q[qoff + col + 2], data_q[qoff + col + 3]);
+}
+
+float dot_acc(const vec4 v, const vec4 b, const float acc) {
+    return fma(v.x, b.x, fma(v.y, b.y, fma(v.z, b.z, fma(v.w, b.w, acc))));
+}
+
+float rms_x(const bool from_cur, const uint t, const uint col) {
+    return from_cur ? data_c[p.oc + t*p.nbc2 + col] : ysh[col];
+}
+
+// the inverse RMS of a row, as rms_norm.comp: inversesqrt(sum/ncols + eps)
+float rms_scale(const bool from_cur, const uint t, const float eps) {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint ncols = p.ne0;
+    [[unroll]] for (uint r = 0; r < (512 + BLOCK_SIZE - 1) / BLOCK_SIZE; ++r) {
+        const uint v = tid + r*BLOCK_SIZE;
+        if (r*BLOCK_SIZE < p.rms_bs) {
+            float sum = 0.0f;
+            if (v < p.rms_bs) {
+                // rms_norm.comp's unrolled sum += xi*xi as ANV compiles it: the first add of two products is
+                // fma(x0, x0, x1*x1) (it fuses the first product, the second one rounded), then fma(xi, xi, sum).
+                // A plain fma chain from fl(x0*x0) rounds differently in ~5% of the rows of 1024..4096 columns.
+                uint col = v;
+                if (col + p.rms_bs < ncols) {
+                    const float x0 = rms_x(from_cur, t, col);
+                    const float x1 = rms_x(from_cur, t, col + p.rms_bs);
+                    precise float p1 = x1 * x1;
+                    sum = fma(x0, x0, p1);
+                    col += 2*p.rms_bs;
+                }
+                for (; col < ncols; col += p.rms_bs) {
+                    const float xi = rms_x(from_cur, t, col);
+                    sum = fma(xi, xi, sum);
+                }
+            }
+            sum = subgroupAdd(sum);
+            if (v < p.rms_bs && subgroupElect()) {
+                rms_sh[v / SG_SIZE] = sum;
+            }
+        }
+    }
+    barrier();
+    if (tid < SG_SIZE) {
+        float sum = 0.0f;
+        if (p.rms_sg == 32) {
+            // the 32-lane subgroup sums, then the second level: lane l < n_sg reads sum l, one 32-lane subgroupAdd
+            // whose upper half is zeros (T(...) + 0); or, n_sg <= 4, the sequential fast path
+            const uint n_sg = p.rms_bs / 32;
+            if (n_sg <= 4) {
+                for (uint i = 0; i < n_sg; ++i) {
+                    sum += rms_sh[2*i] + rms_sh[2*i + 1];
+                }
+            } else {
+                const uint l = gl_SubgroupInvocationID;
+                if (l < n_sg) {
+                    sum += rms_sh[2*l] + rms_sh[2*l + 1];
+                }
+                sum = subgroupAdd(sum);
+            }
+        } else {
+            for (uint i = gl_SubgroupInvocationID; i < p.rms_bs / SG_SIZE; i += SG_SIZE) {
+                sum += rms_sh[i];
+            }
+            sum = subgroupAdd(sum);
+        }
+        if (tid == 0) {
+            const float mean = sum / float(ncols);
+            rms_res = inversesqrt(mean + eps);
+        }
+    }
+    barrier();
+    return rms_res;
+}
+
+void main() {
+    const uint q   = gl_WorkGroupID.y;
+    const uint t   = gl_WorkGroupID.z;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint n_states = p.n_stack + 1;
+    const uint qoff     = p.oq + q*p.nbq1;
+
+    if ((p.flags & 1) != 0) {
+        cur_scale = rms_scale(true, t, p.eps_in);
+    }
+
+    const uint P    = p.large != 0 ? 4*SG_SIZE : SG_SIZE;
+    const uint G    = BLOCK_SIZE / P;
+    const uint g    = tid / P;
+    const uint lane = tid % P;
+    const uint step = 4*P;
+
+    float temp[MAX_PER_GROUP];
+    [[unroll]] for (uint j = 0; j < MAX_PER_GROUP; ++j) {
+        temp[j] = 0.0f;
+    }
+
+    uint col = 4*lane;
+    for (; col + 2*step < p.ne0; col += 3*step) {
+        const vec4 b0 = load_query4(qoff, col);
+        const vec4 b1 = load_query4(qoff, col + step);
+        const vec4 b2 = load_query4(qoff, col + 2*step);
+        [[unroll]] for (uint j = 0; j < MAX_PER_GROUP; ++j) {
+            const uint k = g + G*j;
+            if (k < n_states) {
+                const vec4 v0 = load_state4(k, t, col);
+                const vec4 v1 = load_state4(k, t, col + step);
+                const vec4 v2 = load_state4(k, t, col + 2*step);
+                temp[j] = dot_acc(v0, b0, temp[j]);
+                temp[j] = dot_acc(v1, b1, temp[j]);
+                temp[j] = dot_acc(v2, b2, temp[j]);
+            }
+        }
+    }
+    for (; col < p.ne0; col += step) {
+        const vec4 b0 = load_query4(qoff, col);
+        [[unroll]] for (uint j = 0; j < MAX_PER_GROUP; ++j) {
+            const uint k = g + G*j;
+            if (k < n_states) {
+                temp[j] = dot_acc(load_state4(k, t, col), b0, temp[j]);
+            }
+        }
+    }
+
+    [[unroll]] for (uint j = 0; j < MAX_PER_GROUP; ++j) {
+        const uint k = g + G*j;
+        if (k < n_states) {
+            const float s = subgroupAdd(temp[j]);
+            if (gl_SubgroupInvocationID == 0) {
+                part[k][lane / SG_SIZE] = s;
+            }
+        }
+    }
+    barrier();
+    if (tid < n_states) {
+        float d;
+        if (p.large != 0) {
+            d = 0.0f;
+            [[unroll]] for (uint s = 0; s < 4; ++s) {
+                d += part[tid][s];
+            }
+        } else {
+            d = part[tid][0];
+        }
+        dots[tid] = d;
+    }
+    barrier();
+
+    float max_val = uintBitsToFloat(0xFF800000);
+    float v[MAX_STATES];
+    [[unroll]] for (uint k = 0; k < MAX_STATES; ++k) {
+        if (k < n_states) {
+            precise float vk = dots[k] * p.scale;
+            v[k] = vk;
+            max_val = max(max_val, vk);
+        }
+    }
+
+    float ex[MAX_STATES];
+    float vals[MAX_STATES];
+    [[unroll]] for (uint k = 0; k < MAX_STATES; ++k) {
+        if (k < n_states) {
+            precise float x = v[k] - max_val;
+            ex[k] = exp(x);
+        } else {
+            ex[k] = 0.0f;
+        }
+        vals[k] = ex[k];
+    }
+    [[unroll]] for (uint s = MAX_STATES / 2; s > 0; s >>= 1) {
+        [[unroll]] for (uint i = 0; i < s; ++i) {
+            vals[i] += vals[i + s];
+        }
+    }
+    const float sum = vals[0];
+    float rcpdivisor = 1.0/sum;
+
+    float w[MAX_STATES];
+    [[unroll]] for (uint k = 0; k < MAX_STATES; ++k) {
+        precise float wk = ex[k] * rcpdivisor;
+        w[k] = wk;
+    }
+
+    const uint dbase = p.od + t*p.nbd2 + q*p.nbd1;
+    const bool norm_out = (p.flags & 2) != 0;
+    for (uint e = tid; e < p.ne0; e += BLOCK_SIZE) {
+        float acc = 0.0f;
+        [[unroll]] for (uint k = 0; k < MAX_STATES; ++k) {
+            if (k < n_states) {
+                acc += load_state(k, t, e) * w[k];
+            }
+        }
+        if (norm_out) {
+            ysh[e] = acc;
+            if ((p.flags & 4) != 0) {
+                data_d[dbase + p.nbd3 + e] = acc;
+            }
+        } else {
+            data_d[dbase + e] = acc;
+        }
+    }
+    if (!norm_out) {
+        return;
+    }
+    barrier();
+
+    const float sc = rms_scale(false, t, p.eps_out);
+    const uint woff = p.ow + q*p.nbw1;
+    if ((p.flags & 8) != 0) {
+        for (uint e = tid; e < p.ne0; e += BLOCK_SIZE) {
+            data_d[dbase + e] = sc * ysh[e] * data_w[woff + e];
+        }
+    } else {
+        for (uint e = tid; e < p.ne0; e += BLOCK_SIZE) {
+            data_d[dbase + e] = sc * ysh[e];
+        }
+    }
+}

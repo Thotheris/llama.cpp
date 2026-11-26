@@ -1,0 +1,74 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// y = (x - tanh(forget)*x) + tanh(gain)*m with [gain | forget] = w*z, per element, workgroup (element block, t).
+// It replaces the f32 MUL_MAT (mul_mat_vec) of the stacked gates and GATE_MIX and keeps their rounding:
+// - each gate row is one subgroup of SG lanes, as the mul_mat_vec.comp pipeline with one subgroup per workgroup
+//   (k < 1024): per-lane fma chains over the columns 4*lane + 4*SG*i, then subgroupAdd;
+// - the blend is gate_mix.comp: its tanh expression, the products, difference and sum marked precise.
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 64;
+layout (constant_id = 1) const uint SG = 16;  // the mul_mat_vec subgroup size, this pipeline's subgroup size
+layout (constant_id = 2) const uint EPS = 1;  // elements per subgroup
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {float data_x[];};
+layout (binding = 1) readonly buffer M {float data_m[];};
+layout (binding = 2) readonly buffer W {vec4 data_w4[];};
+layout (binding = 3) readonly buffer Z {float data_z[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+
+// vk_op_gate_mix_mv_push_constants
+layout (push_constant) uniform parameter
+{
+    uint n;     // elements per row of x, m and dst
+    uint k;     // the bottleneck width (columns of w)
+    uint nbx, nbm, nbz, nbd; // token strides in elements
+    uint ox, om, ow4, oz, od; // misalignment of x, m, z, dst (in elements) and w (in vec4)
+    uint nbw4; // the row stride of w in vec4: 0 for one weight for all rows
+} p;
+
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+float row_dot(const uint row, const uint t, const uint lane) {
+    float temp = 0.0f;
+    for (uint col = 4*lane; col < p.k; col += 4*SG) {
+        const vec4 wv = data_w4[p.ow4 + t*p.nbw4 + (row*p.k + col)/4];
+        const uint i = p.oz + t*p.nbz + col;
+        const vec4 zv = vec4(data_z[i], data_z[i + 1], data_z[i + 2], data_z[i + 3]);
+        temp = fma(wv.x, zv.x, fma(wv.y, zv.y, fma(wv.z, zv.z, fma(wv.w, zv.w, temp))));
+    }
+    return subgroupAdd(temp);
+}
+
+void main() {
+    const uint t    = gl_WorkGroupID.y;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint i0   = (gl_WorkGroupID.x*gl_NumSubgroups + gl_SubgroupID)*EPS;
+
+    [[unroll]] for (uint e = 0; e < EPS; ++e) {
+        const uint i = i0 + e;
+        if (i >= p.n) {
+            break;
+        }
+        const float gain   = op_tanh(row_dot(i,       t, lane));
+        const float forget = op_tanh(row_dot(p.n + i, t, lane));
+
+        if (lane == 0) {
+            const float x = data_x[p.ox + t*p.nbx + i];
+            const float m = data_m[p.om + t*p.nbm + i];
+
+            precise float fx = forget * x;
+            precise float a  = x - fx;
+            precise float gm = gain * m;
+            precise float y  = a + gm;
+
+            data_d[p.od + t*p.nbd + i] = y;
+        }
+    }
+}

@@ -1,0 +1,91 @@
+#version 450
+
+#include "types.glsl"
+#include "utils.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = x*s * clamp(threshold / (||x*s||_2 + 1e-6), 0, 1) per row, s optional (broadcast over rows).
+// One workgroup per row. The reduction is the same as sum_rows.comp (same BLOCK_SIZE, same strided
+// partial sums and tree), and the values the unfused MUL, SQR, SUM_ROWS, SQRT, SCALE, DIV, CLAMP,
+// MUL chain stored to memory are marked precise, so the result matches that chain bit for bit.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+// vk_op_l2_clip_push_constants
+layout (push_constant) uniform parameter
+{
+    uint n_cols;
+    uint ne01, ne02, ne03;
+    uint nb01, nb02, nb03;
+    uint nb11, nb12, nb13;
+    uint has_scale;
+    uint sne1, sne2, sne3;
+    uint snb1, snb2, snb3;
+    float threshold;
+    uint misalign_offsets;
+    uint ne0_12mp, ne0_12L;
+    uint ne0_1mp, ne0_1L;
+} p;
+
+uint get_aoffset() { return p.misalign_offsets >> 16; }
+uint get_boffset() { return (p.misalign_offsets >> 8) & 0xFF; }
+uint get_doffset() { return p.misalign_offsets & 0xFF; }
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+shared float tmp[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint col = gl_LocalInvocationID.x;
+
+    if (row >= p.ne01 * p.ne02 * p.ne03) { return; }
+
+    const uint i03 = fastdiv(row, p.ne0_12mp, p.ne0_12L);
+    const uint i03_offset = i03 * p.ne01*p.ne02;
+    const uint i02 = fastdiv(row - i03_offset, p.ne0_1mp, p.ne0_1L);
+    const uint i01 = row - i03_offset - i02*p.ne01;
+
+    const uint src_idx = get_aoffset() + i01 * p.nb01 + i02 * p.nb02 + i03 * p.nb03;
+    const uint dst_idx = get_doffset() + i01 * p.nb11 + i02 * p.nb12 + i03 * p.nb13;
+    const uint scl_idx = get_boffset() + (i01 % p.sne1) * p.snb1 + (i02 % p.sne2) * p.snb2 + (i03 % p.sne3) * p.snb3;
+    const bool has_scale = p.has_scale != 0;
+
+    precise float acc = 0.0f;
+    for (uint i = col; i < p.n_cols; i += BLOCK_SIZE) {
+        precise float xi = data_a[src_idx + i];
+        if (has_scale) {
+            xi = xi * data_b[scl_idx + i];
+        }
+        precise float sq = xi * xi;
+        acc = acc + sq;
+    }
+    tmp[col] = acc;
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (col < s) {
+            tmp[col] += tmp[col + s];
+        }
+        barrier();
+    }
+
+    precise float norm = sqrt(tmp[0]);
+    norm = norm + 1e-6f;
+    float factor = p.threshold / norm;
+    factor = clamp(factor, 0.0f, 1.0f);
+
+    for (uint i = col; i < p.n_cols; i += BLOCK_SIZE) {
+        precise float xi = data_a[src_idx + i];
+        if (has_scale) {
+            xi = xi * data_b[scl_idx + i];
+        }
+        precise float yi = xi * factor;
+        data_d[dst_idx + i] = yi;
+    }
+}

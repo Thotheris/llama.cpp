@@ -834,6 +834,10 @@ void process_shaders() {
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         }
+        // MUL_MAT_ID grouped by expert, small batches
+        if (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "q4_k" || tname == "q5_k") {
+            string_to_spv("mul_mat_vecq_idt_" + tname + "_q8_1_f32", "mul_mat_vecq_idt.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
+        }
 #endif
 
         // Dequant shaders
@@ -959,7 +963,11 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
     string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
+    string_to_spv("fa_decode_split", "flash_attn_decode_split.comp", {});
+    string_to_spv("fa_decode_combine", "flash_attn_decode_combine.comp", {});
     string_to_spv("fa_prefill", "flash_attn_prefill.comp", {}, true, true, false, false);
+    string_to_spv("fa_prefill_rel", "flash_attn_prefill_rel.comp", {}, true, true, false, false);
+    string_to_spv("fa_rel_tiles", "flash_attn_rel_tiles.comp", {});
 #endif
 
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
@@ -970,6 +978,10 @@ void process_shaders() {
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
+    string_to_spv("quantize_q8_1_x4_situ", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"FUSE_SITU", "1"}});
+    string_to_spv("quantize_q8_1_x4_situ_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}, {"FUSE_SITU", "1"}});
+    string_to_spv("quantize_q8_1_x4_mul", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"FUSE_MUL", "1"}});
+    string_to_spv("quantize_q8_1_x4_mul_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}, {"FUSE_MUL", "1"}});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
@@ -1005,7 +1017,7 @@ void process_shaders() {
                                      "elu", "xielu", "sgn", "softplus", "step", "round", "ceil", "floor", "trunc"}) {
             string_to_spv(op + "_" + t, "unary.comp", merge_maps(dict, {{"OP", "op_" + op}}));
         }
-        for (const std::string op : {"geglu", "reglu", "swiglu", "swiglu_oai", "swiglu_clamp", "geglu_erf", "geglu_quick"}) {
+        for (const std::string op : {"geglu", "reglu", "swiglu", "swiglu_oai", "swiglu_clamp", "geglu_erf", "geglu_quick", "situ"}) {
             string_to_spv(op + "_" + t, op + ".comp", dict);
         }
         string_to_spv("log_" + t, "log.comp", dict);
@@ -1019,6 +1031,10 @@ void process_shaders() {
             string_to_spv(op + "_mul_" + t, "unary.comp", merge_maps(mul_dict, {{"OP", "op_" + op}}));
         }
     }
+
+    // situ of f32 gate/up halves written as f16: the B staging of a batched MUL_MAT_ID that reads the situ (same
+    // expressions as situ_f32, then the f32 -> f16 conversion of contig_cpy_f32_f16)
+    string_to_spv("situ_f32_f16", "situ.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
 
     string_to_spv("tri_16",         "tri.comp",         {{"A_TYPE", "uint16_t"},    {"D_TYPE", "uint16_t"}});
     string_to_spv("tri_32",         "tri.comp",         {{"A_TYPE", "uint"},        {"D_TYPE", "uint"}});
@@ -1071,6 +1087,19 @@ void process_shaders() {
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("l2_clip_f32", "l2_clip.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("gate_mix_f32", "gate_mix.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("block_mix_f32", "block_mix.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("block_mix_multi_f32", "block_mix_multi.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("block_mix_norm_f32", "block_mix_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("gate_mix_mv_f32", "gate_mix_mv.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("gate_mix_mm_f32", "gate_mix_mm.comp", base_dict, true, true);
+#endif
+    string_to_spv("rel_bias_f32", "rel_bias.comp", merge_maps(base_dict, {{"D_TYPE", "float"}}));
+    string_to_spv("rel_bias_f16", "rel_bias.comp", merge_maps(base_dict, {{"D_TYPE", "float16_t"}, {"D_TYPEV2", "f16vec2"}}));
+    string_to_spv("rel_bias_f16in_f32", "rel_bias.comp", merge_maps(base_dict, {{"D_TYPE", "float"}, {"F16_INPUTS", "1"}}));
+    string_to_spv("rel_bias_f16in_f16", "rel_bias.comp", merge_maps(base_dict, {{"D_TYPE", "float16_t"}, {"D_TYPEV2", "f16vec2"}, {"F16_INPUTS", "1"}}));
     string_to_spv("cross_entropy_loss_f32", "cross_entropy_loss.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cross_entropy_loss_back_f32", "cross_entropy_loss_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("fwht_f32", "fwht.comp", {{"A_TYPE", "float"}});
@@ -1230,8 +1259,12 @@ void process_shaders() {
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
+    string_to_spv("ssm_conv_hist_f32", "ssm_conv_hist.comp", {});
+    string_to_spv("ssm_conv_hist_post_f32", "ssm_conv_hist_post.comp", {{"USE_SUBGROUP_ADD", "0"}});
+    string_to_spv("ssm_conv_hist_post_subgroup_f32", "ssm_conv_hist_post.comp", {{"USE_SUBGROUP_ADD", "1"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
+    string_to_spv("topk_moe_sort_f32", "topk_moe_sort.comp", {});
 
     for (auto &c : compiles) {
         c.wait();

@@ -1,0 +1,194 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#if USE_SUBGROUP_ADD
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+
+// ssm_conv_hist.comp, optionally plus an addend, followed by a row post-op over groups of 128 channels of one token:
+//   post 1: the L2 row clip of l2_clip.comp (no scale): the same strided partial sums over L2_BLOCK threads and
+//           the same shared-memory tree, the values the unfused chain stored marked precise
+//   post 2: the RMS norm of rms_norm.comp for 128 columns (BLOCK_SIZE 128, same subgroup or shared reduction)
+// Each value that the unfused SSM_CONV_HIST (and ADD) stored to memory goes through shared memory here, so the
+// post-op reads the same rounded floats. The host requires nr % 128 == 0; the workgroup holds 2 groups.
+
+#define GROUP 128
+#define WG    256
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Past  { float past[]; };
+layout(binding = 1) readonly  buffer Src   { float src[]; };
+layout(binding = 2) readonly  buffer Taps  { float taps[]; };
+layout(binding = 3) writeonly buffer Store { float store[]; };
+layout(binding = 4) readonly  buffer Add   { float addend[]; };
+layout(binding = 5) writeonly buffer Dst   { float dst[]; };
+// the fused SET_ROWS: the result rows go to rows idx[token] of an F32 (Dst) or F16 (DstH) destination
+layout(binding = 6) readonly  buffer Idx   { uvec2 idx[]; };
+layout(binding = 7) writeonly buffer DstH  { float16_t dsth[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint nbp1; uint nbp2;
+    uint nbx1; uint nbx2;
+    uint nbc1;
+    uint nbs1; uint nbs2;
+    uint nbd1; uint nbd2;
+    uint nba1; uint nba2;
+    uint nc; uint nr; uint n_t; uint n_s;
+    uint has_store; uint has_add;
+    uint post; float param; uint ncols;
+    uint op; uint ox; uint oc; uint os; uint oa; uint od;
+    uint set_rows; uint nbr1; uint oi;
+    uint nbs3;
+};
+
+// the BLOCK_SIZE of the l2_clip pipeline (the device subgroup size)
+layout(constant_id = 0) const uint L2_BLOCK = 32;
+
+shared float vals[WG];
+shared float red[WG];
+
+float win(const uint i3, const uint i1, const uint col) {
+    if (col < nc - 1) {
+        return past[op + i3*nbp2 + i1*nbp1 + col];
+    }
+    return src[ox + i3*nbx2 + (col - (nc - 1))*nbx1 + i1];
+}
+
+// the sum of ssm_conv_hist.comp; a function, so the precise values of the post-op (which read it back from shared
+// memory) do not propagate NoContraction into it (it is not precise in ssm_conv_hist.comp)
+float conv_value(const uint i3, const uint i1, const uint i2) {
+    const uint c_base = oc + i1*nbc1;
+
+    float sum = 0.0;
+
+    if (nc == 4) {
+        sum = dot(
+            vec4(win(i3, i1, i2), win(i3, i1, i2 + 1), win(i3, i1, i2 + 2), win(i3, i1, i2 + 3)),
+            vec4(taps[c_base], taps[c_base + 1], taps[c_base + 2], taps[c_base + 3])
+        );
+    } else {
+        [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
+            sum += win(i3, i1, i2 + i0) * taps[c_base + i0];
+        }
+    }
+
+    return sum;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint i1  = gl_GlobalInvocationID.x; // channel
+    const uint i2  = gl_WorkGroupID.y;        // token
+    const uint i3  = gl_WorkGroupID.z;        // sequence
+
+    const bool valid = i1 < nr;
+
+    const uint g    = tid % GROUP;       // column within the group
+    const uint gb   = tid - g;           // first thread of the group
+    float conv = 0.0;
+    if (valid) {
+        conv = conv_value(i3, i1, i2);
+        if (i2 < has_store) {
+            for (uint j = 0; j < nc - 1; j++) {
+                store[os + i2*nbs3 + i3*nbs2 + i1*nbs1 + j] = win(i3, i1, n_t - i2 + j);
+            }
+        }
+    }
+    vals[tid] = conv;
+    barrier();
+
+    if (has_add != 0) {
+        precise float s = vals[tid];
+        if (valid) {
+            s = s + addend[oa + i3*nba2 + i2*nba1 + i1];
+        }
+        barrier();
+        vals[tid] = s;
+        barrier();
+    }
+
+    precise float xi = vals[tid];
+    float res = xi;
+
+    if (post == 1) {
+        // l2_clip.comp with BLOCK_SIZE = L2_BLOCK, one group per row
+        precise float acc = 0.0f;
+        if (g < L2_BLOCK) {
+            for (uint i = g; i < GROUP; i += L2_BLOCK) {
+                precise float xj = vals[gb + i];
+                precise float sq = xj * xj;
+                acc = acc + sq;
+            }
+            red[gb + g] = acc;
+        }
+        barrier();
+        [[unroll]] for (int s = int(L2_BLOCK) / 2; s > 0; s >>= 1) {
+            if (g < s) {
+                red[gb + g] += red[gb + g + s];
+            }
+            barrier();
+        }
+
+        precise float norm = sqrt(red[gb]);
+        norm = norm + 1e-6f;
+        float factor = param / norm;
+        factor = clamp(factor, 0.0f, 1.0f);
+
+        precise float yi = xi * factor;
+        res = yi;
+    } else if (post == 2) {
+        // rms_norm.comp for ncols = 128 <= BLOCK_SIZE = 128: one column per thread
+        float sum = 0.0f;
+        sum += xi * xi;
+#if USE_SUBGROUP_ADD
+        const uint nsg  = GROUP / gl_SubgroupSize;     // the gl_NumSubgroups of the 128-thread rms_norm workgroup
+        const uint sg0  = gb / gl_SubgroupSize;        // first subgroup of the group
+        sum = subgroupAdd(sum);
+        if (subgroupElect()) {
+            red[gl_SubgroupID] = sum;
+        }
+        barrier();
+        sum = 0.0f;
+        if (nsg <= 4) {
+            [[unroll]] for (uint i = 0; i < nsg; ++i) {
+                sum += red[sg0 + i];
+            }
+        } else {
+            for (uint i = gl_SubgroupInvocationID; i < nsg; i += gl_SubgroupSize) {
+                sum += red[sg0 + i];
+            }
+            sum = subgroupAdd(sum);
+        }
+#else
+        red[tid] = sum;
+        barrier();
+        [[unroll]] for (int s = GROUP / 2; s > 0; s >>= 1) {
+            if (g < s) {
+                sum += red[tid + s];
+                red[tid] = sum;
+            }
+            barrier();
+        }
+        sum = red[gb];
+#endif
+        const float mean  = sum / float(ncols);
+        const float scale = inversesqrt(mean + param);
+        res = scale * xi;
+    }
+
+    if (valid) {
+        if (set_rows == 0) {
+            dst[od + i3*nbd2 + i2*nbd1 + i1] = res;
+        } else {
+            const uint row = idx[oi + i3*n_t + i2].x;
+            if (set_rows == 1) {
+                dst[od + row*nbr1 + i1] = res;
+            } else {
+                dsth[od + row*nbr1 + i1] = float16_t(res);
+            }
+        }
+    }
+}

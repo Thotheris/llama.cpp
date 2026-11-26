@@ -1,0 +1,248 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Split-KV decode flash attention (one pass over K and V, "flash decoding").
+// Workgroup (x: split of the cells, y: kv head, z: q batch/stream x group of NQ query rows). The workgroup takes the NQ query rows of the
+// gqa_ratio q heads of its kv head (the heads of a group are folded: K and V are read once for all of them) over
+// the cells [split * chunk, (split + 1) * chunk). Each subgroup walks its own cells (C cells per step, the lanes
+// split the head dims): the scores, an online softmax and the P.V accumulation in registers. A step whose cells are
+// masked (-inf) for every row is skipped before K and V are read (their weights are exactly 0); the masks are read
+// a step ahead. The subgroups are merged in shared
+// memory, the workgroup writes its partial (O, L, max) of each row; flash_attn_decode_combine.comp merges the splits.
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer Q   {float     data_q[];};
+layout (binding = 1) readonly  buffer K4  {f16vec4   data_k4[];};
+layout (binding = 2) readonly  buffer V4  {f16vec4   data_v4[];};
+layout (binding = 3) readonly  buffer M   {float16_t data_m[];};
+// [n_split][n_rows * HS] partial O, then [n_split][n_rows] partial L, then [n_split][n_rows] partial max
+layout (binding = 4) writeonly buffer OUT {float     data_o[];};
+
+// vk_xe_fa_push_constants (strides in elements)
+layout (push_constant) uniform parameter
+{
+    uint neq1;
+    uint neq2;
+    uint neq3;
+    uint nek1;
+    uint nek2;
+    uint nek3;
+    uint nev2;
+    uint nev3;
+    uint nem1;
+    uint nem2;
+    uint nem3;
+    uint nbq1;
+    uint nbq2;
+    uint nbk1;
+    uint nbk2;
+    uint nbv1;
+    uint nbv2;
+    uint nbq3;
+    uint nbk3;
+    uint nbv3;
+    uint nb3;
+    uint flag;
+    float scale;
+    uint chunk;     // cells per split (nbp1)
+    uint n_split;   // nbp3
+} p;
+
+layout (constant_id = 0) const uint WorkGroupSize = 256;
+layout (constant_id = 1) const uint gqa_ratio = 1;
+layout (constant_id = 2) const uint HS = 128;
+layout (constant_id = 3) const uint SubGroupSize = 16;
+layout (constant_id = 4) const uint NQ = 1;
+layout (constant_id = 5) const uint C = 2;
+// workgroup x: the query row groups and z: the splits (the workgroups of the rows of a split and kv head are
+// adjacent, so they share K and V in the cache), instead of x: the splits and z: the row groups
+layout (constant_id = 6) const bool ROWS_FASTEST = false;
+
+const uint NSG = WorkGroupSize / SubGroupSize;
+const uint NR  = gqa_ratio * NQ;           // rows of the workgroup: row r = query row r / gqa_ratio, head r % gqa_ratio
+const uint D4  = HS / 4 / SubGroupSize;    // f16vec4 per lane: lane dims (i * SubGroupSize + lane) * 4 .. + 3
+
+shared float sh_o[NSG * HS];
+shared float sh_m[NSG];
+shared float sh_l[NSG];
+
+void main() {
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint sg    = gl_SubgroupID;
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint split = ROWS_FASTEST ? gl_WorkGroupID.z : gl_WorkGroupID.x;
+    const uint kvh   = gl_WorkGroupID.y;
+    const uint wg_rows = ROWS_FASTEST ? gl_WorkGroupID.x : gl_WorkGroupID.z;
+    // a row's result does not depend on NQ or on the other rows of its workgroup: a step that is masked for
+    // one row only adds exact zeros to it
+    const uint n_groups = (p.neq1 + NQ - 1) / NQ;
+    const uint b     = wg_rows / n_groups;
+    const uint tok0  = (wg_rows % n_groups) * NQ;
+    const uint bk    = b / (p.neq3 / p.nek3);
+    const uint bv    = b / (p.neq3 / p.nev3);
+    const uint bm    = b % p.nem3;
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
+    const uint j0 = split * p.chunk;
+    const uint j1 = min(j0 + p.chunk, p.nek1);
+
+    // the query rows in registers
+    vec4 q[NR][D4];
+    [[unroll]] for (uint r = 0; r < NR; ++r) {
+        const uint tok = min(tok0 + r / gqa_ratio, p.neq1 - 1);
+        const uint h   = kvh * gqa_ratio + r % gqa_ratio;
+        const uint qb  = b * p.nbq3 + h * p.nbq2 + tok * p.nbq1;
+        [[unroll]] for (uint i = 0; i < D4; ++i) {
+            const uint d = (i * SubGroupSize + lane) * 4;
+            q[r][i] = vec4(data_q[qb + d], data_q[qb + d + 1], data_q[qb + d + 2], data_q[qb + d + 3]);
+        }
+    }
+
+    // mask row offsets (a query row past the mask rows has no mask)
+    uint mrow[NR];
+    bool has_mask[NR];
+    [[unroll]] for (uint r = 0; r < NR; ++r) {
+        const uint tok = tok0 + r / gqa_ratio;
+        const uint h   = kvh * gqa_ratio + r % gqa_ratio;
+        has_mask[r] = tok < p.nem1;
+        mrow[r] = ((bm * p.nem2 + h % p.nem2) * p.nem1 + min(tok, p.nem1 - 1)) * p.nek1;
+    }
+
+    const uint k_base = (bk * p.nbk3 + kvh * p.nbk2) / 4;
+    const uint v_base = (bv * p.nbv3 + kvh * p.nbv2) / 4;
+
+    float m[NR];
+    float l[NR];
+    vec4  o[NR][D4];
+    [[unroll]] for (uint r = 0; r < NR; ++r) {
+        m[r] = NEG_FLT_MAX_OVER_2;
+        l[r] = 0.0f;
+        [[unroll]] for (uint i = 0; i < D4; ++i) {
+            o[r][i] = vec4(0.0f);
+        }
+    }
+
+    // C cells per step and subgroup; the masks of the next step are loaded ahead
+    float mk[C][NR];
+    bool live = false;
+    {
+        const uint jb = j0 + sg * C;
+        [[unroll]] for (uint c = 0; c < C; ++c) {
+            const uint j = jb + c;
+            [[unroll]] for (uint r = 0; r < NR; ++r) {
+                mk[c][r] = j < j1 ? (has_mask[r] ? float(data_m[mrow[r] + j]) : 0.0f) : uintBitsToFloat(0xFF800000);
+                live = live || !(mk[c][r] < NEG_FLT_MAX_OVER_2);
+            }
+        }
+    }
+
+    for (uint jb = j0 + sg * C; jb < j1; jb += NSG * C) {
+        float mk_next[C][NR];
+        bool live_next = false;
+        [[unroll]] for (uint c = 0; c < C; ++c) {
+            const uint j = jb + NSG * C + c;
+            [[unroll]] for (uint r = 0; r < NR; ++r) {
+                mk_next[c][r] = j < j1 ? (has_mask[r] ? float(data_m[mrow[r] + j]) : 0.0f) : uintBitsToFloat(0xFF800000);
+                live_next = live_next || !(mk_next[c][r] < NEG_FLT_MAX_OVER_2);
+            }
+        }
+
+        // the same cells in every lane: uniform in the subgroup. A masked cell (-inf for every row) has p == 0.
+        if (live) {
+            vec4 kv[C][D4];
+            vec4 vv[C][D4];
+            [[unroll]] for (uint c = 0; c < C; ++c) {
+                const uint j = min(jb + c, j1 - 1);
+                [[unroll]] for (uint i = 0; i < D4; ++i) {
+                    kv[c][i] = vec4(data_k4[k_base + (j * p.nbk1) / 4 + i * SubGroupSize + lane]);
+                    vv[c][i] = vec4(data_v4[v_base + (j * p.nbv1) / 4 + i * SubGroupSize + lane]);
+                }
+            }
+
+            [[unroll]] for (uint r = 0; r < NR; ++r) {
+                float sc[C];
+                float m_new = m[r];
+                [[unroll]] for (uint c = 0; c < C; ++c) {
+                    float acc = 0.0f;
+                    [[unroll]] for (uint i = 0; i < D4; ++i) {
+                        acc += dot(q[r][i], kv[c][i]);
+                    }
+                    sc[c] = subgroupAdd(acc) * p.scale + mk[c][r];
+                    m_new = max(m_new, sc[c]);
+                }
+                const float alpha = exp(m[r] - m_new);
+                l[r] = l[r] * alpha;
+                [[unroll]] for (uint i = 0; i < D4; ++i) {
+                    o[r][i] = o[r][i] * alpha;
+                }
+                [[unroll]] for (uint c = 0; c < C; ++c) {
+                    const float pj = exp(sc[c] - m_new);
+                    l[r] = l[r] + pj;
+                    [[unroll]] for (uint i = 0; i < D4; ++i) {
+                        o[r][i] = o[r][i] + pj * vv[c][i];
+                    }
+                }
+                m[r] = m_new;
+            }
+        }
+
+        [[unroll]] for (uint c = 0; c < C; ++c) {
+            [[unroll]] for (uint r = 0; r < NR; ++r) {
+                mk[c][r] = mk_next[c][r];
+            }
+        }
+        live = live_next;
+    }
+
+    // merge the subgroups, one row at a time
+    const uint n_rows = p.neq3 * p.neq1 * p.neq2;
+    const uint o_stride = n_rows * HS;
+    const uint l_base = p.n_split * o_stride;
+    const uint m_base = l_base + p.n_split * n_rows;
+
+    [[unroll]] for (uint r = 0; r < NR; ++r) {
+        [[unroll]] for (uint i = 0; i < D4; ++i) {
+            const uint d = (i * SubGroupSize + lane) * 4;
+            sh_o[sg * HS + d    ] = o[r][i].x;
+            sh_o[sg * HS + d + 1] = o[r][i].y;
+            sh_o[sg * HS + d + 2] = o[r][i].z;
+            sh_o[sg * HS + d + 3] = o[r][i].w;
+        }
+        if (lane == 0) {
+            sh_m[sg] = m[r];
+            sh_l[sg] = l[r];
+        }
+        barrier();
+
+        const uint tok = tok0 + r / gqa_ratio;
+        const uint row = (b * p.neq1 + tok) * p.neq2 + kvh * gqa_ratio + r % gqa_ratio;
+        if (tok < p.neq1) {
+            float mx = NEG_FLT_MAX_OVER_2;
+            [[unroll]] for (uint s = 0; s < NSG; ++s) {
+                mx = max(mx, sh_m[s]);
+            }
+            for (uint d = tid; d < HS; d += WorkGroupSize) {
+                float acc = 0.0f;
+                [[unroll]] for (uint s = 0; s < NSG; ++s) {
+                    acc += sh_o[s * HS + d] * exp(sh_m[s] - mx);
+                }
+                data_o[split * o_stride + row * HS + d] = acc;
+            }
+            if (tid == 0) {
+                float ls = 0.0f;
+                [[unroll]] for (uint s = 0; s < NSG; ++s) {
+                    ls += sh_l[s] * exp(sh_m[s] - mx);
+                }
+                data_o[l_base + split * n_rows + row] = ls;
+                data_o[m_base + split * n_rows + row] = mx;
+            }
+        }
+        barrier();
+    }
+}

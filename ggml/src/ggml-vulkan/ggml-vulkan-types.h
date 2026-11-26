@@ -383,7 +383,9 @@ struct vk_queue {
     bool transfer_only;
 };
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// pipelines exist for 1..mul_mat_vec_max_cols columns; mul_mat_vec_base_cols is the default limit
+static constexpr uint32_t mul_mat_vec_max_cols = 16;
+static constexpr uint32_t mul_mat_vec_base_cols = 8;
 
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
@@ -465,10 +467,12 @@ struct vk_xe_fa_pipeline_state {
     bool unaligned_q;
     bool partial_row_mask;
     bool multi_head_mask;
+    // the mask is gathered from a bias table by a pos index (ggml_flash_attn_ext_set_rel_bias), prefill only
+    bool rel_bias = false;
 
     bool operator<(const vk_xe_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, qk_ratio, pv_ratio, decode_n, unaligned_seq_len, unaligned_q, partial_row_mask, multi_head_mask) <
-               std::tie(b.HSK, b.HSV, b.qk_ratio, b.pv_ratio, b.decode_n, b.unaligned_seq_len, b.unaligned_q, b.partial_row_mask, b.multi_head_mask);
+        return std::tie(HSK, HSV, qk_ratio, pv_ratio, decode_n, unaligned_seq_len, unaligned_q, partial_row_mask, multi_head_mask, rel_bias) <
+               std::tie(b.HSK, b.HSV, b.qk_ratio, b.pv_ratio, b.decode_n, b.unaligned_seq_len, b.unaligned_q, b.partial_row_mask, b.multi_head_mask, b.rel_bias);
     }
 };
 
@@ -544,6 +548,12 @@ static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_bias{ GGML
                                                                             GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_CLAMP,
                                                                             GGML_OP_DIV,      GGML_OP_RESHAPE };
 
+// sigmoid gating with a selection bias and an additive eps on the weight sum (SCALE instead of CLAMP)
+static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_eps_bias{ GGML_OP_UNARY,    GGML_OP_RESHAPE,  GGML_OP_ADD,
+                                                                                GGML_OP_ARGSORT,  GGML_OP_VIEW,     GGML_OP_GET_ROWS,
+                                                                                GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_SCALE,
+                                                                                GGML_OP_DIV,      GGML_OP_RESHAPE };
+
 static constexpr std::initializer_list<ggml_op> topk_moe_sqrt_softplus_norm_bias{ GGML_OP_UNARY,    GGML_OP_SQRT,
                                                                                   GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                                   GGML_OP_ARGSORT,  GGML_OP_VIEW,
@@ -557,6 +567,10 @@ static constexpr std::initializer_list<ggml_op> topk_moe_early_softmax     { GGM
 static constexpr std::initializer_list<ggml_op> topk_moe_late_softmax      { GGML_OP_ARGSORT,  GGML_OP_VIEW,
                                                                              GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
                                                                              GGML_OP_SOFT_MAX, GGML_OP_RESHAPE };
+
+// a dim-0 CONCAT read only by the B operand of a MUL_MAT (through a reshape): the matmul reads the two sources
+static constexpr std::initializer_list<ggml_op> concat_mul_mat_pattern     { GGML_OP_CONCAT,   GGML_OP_RESHAPE,
+                                                                             GGML_OP_MUL_MAT };
 
 static constexpr std::initializer_list<ggml_op> snake_pattern              { GGML_OP_MUL,      GGML_OP_SIN,
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
@@ -624,6 +638,21 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_moe_sigmoid_norm
     {10, 0, 9 }, // reshape->src[0]  == div
 };
 
+static constexpr std::initializer_list<std::array<int, 3>> topk_moe_sigmoid_norm_eps_bias_edges {
+    { 1, 0, 0 }, // reshape->src[0]  == sigmoid
+    { 2, 0, 0 }, // add->src[0]      == sigmoid
+    { 3, 0, 2 }, // argsort->src[0]  == add
+    { 4, 0, 3 }, // view->src[0]     == argsort
+    { 5, 0, 1 }, // get_rows->src[0] == reshape
+    { 5, 1, 4 }, // get_rows->src[1] == view
+    { 6, 0, 5 }, // reshape->src[0]  == get_rows
+    { 7, 0, 6 }, // sum_rows->src[0] == reshape
+    { 8, 0, 7 }, // scale->src[0]    == sum_rows
+    { 9, 0, 6 }, // div->src[0]      == reshape
+    { 9, 1, 8 }, // div->src[1]      == scale
+    {10, 0, 9 }, // reshape->src[0]  == div
+};
+
 static constexpr std::initializer_list<std::array<int, 3>> topk_moe_sqrt_softplus_norm_bias_edges {
     { 1, 0, 0 }, // sqrt->src[0]     == softplus
     { 2, 0, 1 }, // reshape->src[0]  == sqrt
@@ -662,6 +691,7 @@ enum topk_moe_mode {
     TOPK_MOE_LATE_SOFTMAX,
     TOPK_MOE_SIGMOID_NORM_BIAS,
     TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS,
+    TOPK_MOE_SIGMOID_NORM_EPS_BIAS, // exact: bitonic sort as argsort, sum_rows tree, true division
     TOPK_MOE_COUNT,
 };
 
@@ -855,6 +885,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_matmul_stream_k_fixup;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_quantize_q8_1_x4_situ;
+    vk_pipeline pipeline_quantize_q8_1_x4_mul;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -936,6 +968,16 @@ struct vk_device_struct {
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
+    vk_pipeline pipeline_l2_clip_f32;
+    vk_pipeline pipeline_gate_mix_f32;
+    vk_pipeline pipeline_block_mix_f32;
+    vk_pipeline pipeline_block_mix_multi_f32;
+    vk_pipeline pipeline_block_mix_norm_f32;
+    vk_pipeline pipeline_rel_bias[2][2]; // [inputs rounded to f16][dst 0=f32, 1=f16]
+    uint32_t block_mix_subgroup_size;
+    uint32_t rms_norm_subgroup_size; // 0: the driver picks
+    vk_pipeline pipeline_gate_mix_mv_f32;
+    vk_pipeline pipeline_gate_mix_mm_f32;
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_unary[GGML_UNARY_OP_COUNT][3];
@@ -956,6 +998,8 @@ struct vk_device_struct {
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_glu[GGML_GLU_OP_COUNT][3];
+    // situ(f32 gate, f32 up) -> f16, the B staging of a batched MUL_MAT_ID (SITU_MUL_MAT_ID at batch)
+    vk_pipeline pipeline_situ_f32_f16;
 
     vk_pipeline pipeline_silu_back_f32;
     vk_pipeline pipeline_soft_max_f32, pipeline_soft_max_f32_f16;
@@ -1022,6 +1066,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
+    vk_pipeline pipeline_ssm_conv_hist_f32;
+    vk_pipeline pipeline_ssm_conv_hist_post_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -1045,11 +1091,24 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     std::map<vk_xe_fa_pipeline_state, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
+    // split-KV decode (flash_attn_decode_split.comp) and the step that combines its splits
+    std::map<vk_xe_fa_pipeline_state, vk_pipeline> pipeline_xe_fa_decode_split;
+    vk_pipeline pipeline_xe_fa_decode_combine;
+    // the tile flags of the rel-bias prefill (flash_attn_rel_tiles.comp), [nek1 not a multiple of the tile]
+    vk_pipeline pipeline_xe_fa_rel_tiles[2];
     std::map<vk_xe_fa_pipeline_state, vk_pipeline> pipeline_xe_fa_prefill;
     vk_pipeline pipeline_count_experts;
+    // MUL_MAT_ID grouped by expert for small batches (q8_1 activations), see mul_mat_vecq_idt.comp
+    // [0]: 4 columns per tile, [1]: 8 columns per tile
+    vk_pipeline pipeline_mul_mat_vecq_idt[2][GGML_TYPE_COUNT];
+    uint32_t mul_mat_id_tiled_cols4_max_n; // largest token count that uses 4-column tiles
+    uint32_t mul_mat_id_tiled_max_n;  // largest token count that uses it
+    uint32_t mul_mat_id_tiled_min_n;  // smallest token count that uses it
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
+    // exact sigmoid + bias + eps-normalised router, indexed by log2 of the padded expert count
+    vk_pipeline pipeline_topk_moe_sort[num_argsort_pipelines];
 
     std::vector<vk_pipeline_ref> all_pipelines;
 
@@ -1300,10 +1359,21 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// graph_optimize memo (see ggml_vk_graph_optimize): input hash -> optimized order and allocation dependencies
+struct vk_graph_opt_memo {
+    uint64_t hash;
+    uint64_t tick;
+    std::vector<ggml_tensor *> order;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> deps; // (tensor, until)
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
     vk_device device;
+
+    std::vector<vk_graph_opt_memo> graph_opt_memo;
+    uint64_t graph_opt_tick = 0;
 
     // Workaround for drivers moving VRAM contents off the GPU when idle
     std::promise<void> keepalive_stop;
@@ -1328,6 +1398,25 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
+
+    // Private q8_1 slots for the quantized inputs of the mat-vec kernels (decode), so that mat-vecs with different
+    // inputs do not take turns on prealloc_y (a barrier before each reuse). A slot holds the quantization of the input,
+    // or of the contiguous tensor the input is a row view of: the other rows read it at their block offset.
+    struct vk_ymv_slot {
+        const ggml_tensor * key {};
+        vk_pipeline_struct * pipeline {};
+        // the quantized range: a node that writes into it drops the slot
+        vk_buffer_struct * src_buf {};
+        uint64_t src_off {}, src_size {};
+        uint64_t last_use {};
+        // a dispatch read the slot after the last barrier
+        bool need_sync {};
+    };
+    static constexpr int ymv_n_slots = 4;
+    static constexpr uint64_t ymv_slot_bytes = 128 * 1024;
+    vk_buffer prealloc_ymv;
+    vk_ymv_slot ymv_slots[ymv_n_slots];
+    uint64_t ymv_clock {};
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
@@ -1368,6 +1457,13 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_mm_gate_mix {};
+    // GLU(SITU) + MUL_MAT_ID mat-vec: the q8_1 quantization of the B matrix computes the situ
+    bool fused_situ_mmid {};
+    bool fused_mul_mm {};
+    bool fused_concat_mm {};
+    // fused_concat_mm: the concat result's range has unsynced readers or writers (see ggml_vk_build_graph)
+    bool fused_concat_mm_dst_hazard {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

@@ -1,0 +1,177 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// MUL_MAT + GATE_MIX fused for a batch of tokens:
+//   g = W z   (W = [gain | forget] f32 rows, [2*ne0, k]; z f32 [k, n])
+//   y = (x - tanh(forget)*x) + tanh(gain)*m
+// The product follows matmul_f32_f32 of mul_mm.comp on coopmat1 devices: W and z are stored to shared memory as
+// f16, the f32 accumulators start at zero and take one coopMatMulAdd per TK-wide k step in ascending k, so g is
+// bit-identical to the unfused MUL_MAT. The blend repeats gate_mix.comp (TANH of unary.comp, precise chain).
+// One workgroup: BM output rows (BM gain rows and the BM matching forget rows of W) by BN tokens; subgroup s owns
+// rows [s*TM, s*TM + TM) for all BN tokens and both gates. x and m are read into registers before the product.
+// W and z are read as vec4 (offsets and row strides multiples of 4 elements). Requires k % 16 == 0 and the 8x16x16 f16 coopmat with subgroup size 16 (Intel Xe2).
+
+#define TM 8
+#define TN 16
+#define TK 16
+#define SG 16
+#define NSG 8
+#define WG_SIZE (NSG * SG)
+#define BM (NSG * TM)         // 64
+#ifndef NT
+#define NT 2
+#endif
+#define BN (NT * TN)
+#define BK 16
+#define STRIDE (BK / 2 + 4)   // f16vec2 per shared row
+
+#define A_VEC4 (2 * BM * BK / 4 / WG_SIZE)   // 4 vec4 of W per invocation and k step
+#define B_TOT  (BN * BK / 4)
+#define B_VEC4 ((B_TOT + WG_SIZE - 1) / WG_SIZE)   // vec4 of z per invocation
+#define E_PER  (BM * BN / WG_SIZE)           // outputs per invocation
+#define E_BLK  (E_PER / NT)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer W {vec4 data_w[];};
+layout (binding = 1) readonly  buffer Z {vec4 data_z[];};
+layout (binding = 2) readonly  buffer X {float data_x[];};
+layout (binding = 3) readonly  buffer M {float data_m[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint ne0;
+    uint n;
+    uint k;
+    uint nbw1, nbz1, nbx1, nbm1, nbd1;
+    uint ow, oz, ox, om, od;
+} p;
+
+shared f16vec2 buf_a[2 * BM * STRIDE];
+shared f16vec2 buf_b[BN * STRIDE];
+shared float res_g[BM * TN];
+shared float res_f[BM * TN];
+
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+vec4 load_w(uint row, uint k4, uint r0, uint kk) {
+    // row < BM: gain row r0 + row, else forget row ne0 + r0 + row - BM
+    const uint r = row < BM ? r0 + row : r0 + row - BM;
+    if (r >= p.ne0) {
+        return vec4(0.0f);
+    }
+    return data_w[(p.ow + (row < BM ? r : p.ne0 + r) * p.nbw1 + kk) / 4 + k4];
+}
+
+vec4 load_z(uint t, uint k4, uint c0, uint kk) {
+    if (c0 + t >= p.n) {
+        return vec4(0.0f);
+    }
+    return data_z[(p.oz + (c0 + t) * p.nbz1 + kk) / 4 + k4];
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r0  = gl_WorkGroupID.x * BM;
+    const uint c0  = gl_WorkGroupID.y * BN;
+    const uint sg  = gl_SubgroupID;
+
+    // BK/4 = 4 vec4 per shared row
+    vec4 ra[A_VEC4];
+    vec4 rb[B_VEC4];
+    [[unroll]] for (uint i = 0; i < A_VEC4; i++) {
+        const uint idx = tid + i * WG_SIZE;
+        ra[i] = load_w(idx / 4, idx % 4, r0, 0);
+    }
+    [[unroll]] for (uint i = 0; i < B_VEC4; i++) {
+        const uint idx = tid + i * WG_SIZE;
+        rb[i] = idx < B_TOT ? load_z(idx / 4, idx % 4, c0, 0) : vec4(0.0f);
+    }
+
+    coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> ca_g;
+    coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> ca_f;
+    coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cb;
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc_g[NT];
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc_f[NT];
+    [[unroll]] for (uint j = 0; j < NT; j++) {
+        acc_g[j] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+        acc_f[j] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+    }
+
+    for (uint kk = 0; kk < p.k; kk += BK) {
+        [[unroll]] for (uint i = 0; i < A_VEC4; i++) {
+            const uint idx = tid + i * WG_SIZE;
+            const f16vec4 h = f16vec4(ra[i]);
+            buf_a[(idx / 4) * STRIDE + 2 * (idx % 4)    ] = h.xy;
+            buf_a[(idx / 4) * STRIDE + 2 * (idx % 4) + 1] = h.zw;
+        }
+        [[unroll]] for (uint i = 0; i < B_VEC4; i++) {
+            const uint idx = tid + i * WG_SIZE;
+            if (B_TOT % WG_SIZE != 0 && idx >= B_TOT) {
+                continue;
+            }
+            const f16vec4 h = f16vec4(rb[i]);
+            buf_b[(idx / 4) * STRIDE + 2 * (idx % 4)    ] = h.xy;
+            buf_b[(idx / 4) * STRIDE + 2 * (idx % 4) + 1] = h.zw;
+        }
+        barrier();
+
+        // prefetch the next k step
+        if (kk + BK < p.k) {
+            [[unroll]] for (uint i = 0; i < A_VEC4; i++) {
+                const uint idx = tid + i * WG_SIZE;
+                ra[i] = load_w(idx / 4, idx % 4, r0, kk + BK);
+            }
+            [[unroll]] for (uint i = 0; i < B_VEC4; i++) {
+                const uint idx = tid + i * WG_SIZE;
+                rb[i] = idx < B_TOT ? load_z(idx / 4, idx % 4, c0, kk + BK) : vec4(0.0f);
+            }
+        }
+
+        coopMatLoad(ca_g, buf_a, (sg * TM) * STRIDE, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(ca_f, buf_a, (BM + sg * TM) * STRIDE, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint j = 0; j < NT; j++) {
+            coopMatLoad(cb, buf_b, (j * TN) * STRIDE, STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            acc_g[j] = coopMatMulAdd(ca_g, cb, acc_g[j]);
+            acc_f[j] = coopMatMulAdd(ca_f, cb, acc_f[j]);
+        }
+        barrier();
+    }
+
+    // one TN-token block of the tile at a time through res[t * BM + row]
+    [[unroll]] for (uint j = 0; j < NT; j++) {
+        coopMatStore(acc_g[j], res_g, sg * TM, BM, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatStore(acc_f[j], res_f, sg * TM, BM, gl_CooperativeMatrixLayoutColumnMajor);
+        barrier();
+
+        [[unroll]] for (uint i = 0; i < E_BLK; i++) {
+            const uint el = tid + i * WG_SIZE;       // within block j: token el / BM, row el % BM
+            const uint i0 = r0 + el % BM;
+            const uint i1 = c0 + j * TN + el / BM;
+            if (i0 < p.ne0 && i1 < p.n) {
+                const float x = data_x[p.ox + i0 + i1 * p.nbx1];
+                const float m = data_m[p.om + i0 + i1 * p.nbm1];
+
+                const float gain   = op_tanh(res_g[el]);
+                const float forget = op_tanh(res_f[el]);
+
+                precise float fx = forget * x;
+                precise float a  = x - fx;
+                precise float gm = gain * m;
+                precise float y  = a + gm;
+
+                data_d[p.od + i0 + i1 * p.nbd1] = y;
+            }
+        }
+        barrier();
+    }
+}

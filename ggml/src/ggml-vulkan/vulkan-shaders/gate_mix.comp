@@ -1,0 +1,69 @@
+#version 450
+
+#include "types.glsl"
+#include "utils.glsl"
+
+// y = (x - forget*x) + gain*m per element, g = [gain | forget] with 2*ne0 values per row of x.
+// One invocation per element. The products, the difference and the sum are marked precise, so none is
+// contracted into an fma and the result matches the unfused MUL, SUB, MUL, ADD chain bit for bit.
+// With tanh_gates the gates go through the TANH of unary.comp first.
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {float data_x[];};
+layout (binding = 1) readonly buffer M {float data_m[];};
+layout (binding = 2) readonly buffer G {float data_g[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+// vk_op_gate_mix_push_constants
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint ne0;
+    uint nbx1, nbx2, nbx3;
+    uint nbm1, nbm2, nbm3;
+    uint nbg1, nbg2, nbg3;
+    uint nbd1, nbd2, nbd3;
+    uint ox, om, og, od;
+    uint tanh_gates;
+    uint ne012mp, ne012L;
+    uint ne01mp, ne01L;
+    uint ne0mp, ne0L;
+    uint ne012, ne01;
+} p;
+
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint i3 = fastdiv(idx, p.ne012mp, p.ne012L);
+    uint rem = idx - i3*p.ne012;
+    const uint i2 = fastdiv(rem, p.ne01mp, p.ne01L);
+    rem = rem - i2*p.ne01;
+    const uint i1 = fastdiv(rem, p.ne0mp, p.ne0L);
+    const uint i0 = rem - i1*p.ne0;
+
+    const float x  = data_x[p.ox + i0 + i1*p.nbx1 + i2*p.nbx2 + i3*p.nbx3];
+    const float m  = data_m[p.om + i0 + i1*p.nbm1 + i2*p.nbm2 + i3*p.nbm3];
+    const uint  gi = p.og + i0 + i1*p.nbg1 + i2*p.nbg2 + i3*p.nbg3;
+
+    float gain   = data_g[gi];
+    float forget = data_g[gi + p.ne0];
+    if (p.tanh_gates != 0) {
+        gain   = op_tanh(gain);
+        forget = op_tanh(forget);
+    }
+
+    precise float fx = forget * x;
+    precise float a  = x - fx;
+    precise float gm = gain * m;
+    precise float y  = a + gm;
+
+    data_d[p.od + i0 + i1*p.nbd1 + i2*p.nbd2 + i3*p.nbd3] = y;
+}

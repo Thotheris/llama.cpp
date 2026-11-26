@@ -67,8 +67,28 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     }
     LLAMA_LOG_INFO("%s: DFlash extract_layers = [%s]\n", __func__, layers.c_str());
 
+    // Inkling2 DSpark: no shared fc, a softmax mix of the target features per draft layer
+    const bool is_inkling2 = ml.get_tensor_meta("dspark_fuse.weight") != nullptr;
+
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
-    if (hparams.dsv4_hc_mult > 0) {
+    if (is_inkling2) {
+        if (variant != VARIANT_DSPARK) {
+            throw std::runtime_error("Inkling2 DSpark draft requires the markov head");
+        }
+        backbone = BACKBONE_INKLING2;
+        hparams.dspark_f_rnn = true;
+        ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
+        if (hparams.n_swa == 0) {
+            throw std::runtime_error("Inkling2 DSpark draft expects a sliding window");
+        }
+        // the local layers see sliding_window positions before the block start: the whole block shares the mask
+        // row of its anchor, whose window must reach n_swa positions back
+        hparams.n_swa += 1;
+        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+        ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+        hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+        hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+    } else if (hparams.dsv4_hc_mult > 0) {
         load_hparams_dsv4(ml);
         backbone = hparams.dsv4_hc_single_pass ? BACKBONE_DSV41 : BACKBONE_DSV4;
     } else if (ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK, hparams.n_lora_kv, false)) {
@@ -104,6 +124,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         LLAMA_LOG_INFO("%s: DFlash using d2t mapping (draft_vocab_size = %lld)\n", __func__, (long long) n_vocab_draft);
     }
 
+    if (backbone == BACKBONE_INKLING2) {
+        load_tensors_inkling2();
+        return;
+    }
+
     switch (variant) {
         case VARIANT_DSPARK:   load_tensors_dspark(n_vocab_draft); break;
         case VARIANT_DFLASH2:  load_tensors_dflash2();             break;
@@ -132,10 +157,15 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         case BACKBONE_DSV4:
         case BACKBONE_DSV41:          load_tensors_layers_dsv4();           break;
         case BACKBONE_MISTRAL_LARGE4: load_tensors_layers_mistral_large4(); break;
+        case BACKBONE_INKLING2:       GGML_ABORT("unreachable");
     }
 }
 
 uint32_t llama_model_dflash::graph_nodes_per_tensor() const {
+    if (backbone == BACKBONE_INKLING2) {
+        // the markov chain unrolls ~25 nodes per block slot over few tensors
+        return 16;
+    }
     if (hparams.dsv4_hc_mult > 0) {
         return 32;
     }
@@ -223,7 +253,7 @@ llama_model_dflash::graph<true>::graph(const llm_graph_params & params) : llm_gr
 }
 
 // target features of an injection batch: host embd rows, or rows of the target's layer input device buffer
-static ggml_tensor * build_inp_target_features(llm_graph_context & g, llm_graph_input_embd & inp, int64_t n_embd_inp) {
+ggml_tensor * llama_model_dflash::build_inp_target_features(llm_graph_context & g, llm_graph_input_embd & inp, int64_t n_embd_inp) {
     if (g.ubatch.embd_row) {
         GGML_ASSERT(g.layer_inp_src != nullptr && g.layer_inp_src->ne[0] == n_embd_inp);
 
@@ -621,6 +651,7 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
                 case BACKBONE_DSV4:           return std::make_unique<graph_dsv4>(params);
                 case BACKBONE_DSV41:          return std::make_unique<graph_dsv41>(params);
                 case BACKBONE_MISTRAL_LARGE4: return std::make_unique<graph_mistral_large4>(params);
+                case BACKBONE_INKLING2:       return std::make_unique<graph_inkling2>(params);
             }
             switch (variant) {
                 case VARIANT_DFLASH:   return std::make_unique<graph_dflash>(params);

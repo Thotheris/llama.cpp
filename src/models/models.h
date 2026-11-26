@@ -1647,10 +1647,36 @@ struct llama_model_dflash : public llama_model_base {
         BACKBONE_DSV4,
         BACKBONE_DSV41,
         BACKBONE_MISTRAL_LARGE4,
+        BACKBONE_INKLING2,
     };
 
     variant_type  variant  = VARIANT_DFLASH;
     backbone_type backbone = BACKBONE_BASE;
+
+    // Inkling2 DSpark: each draft layer projects its own softmax mix of the target features to context K/V
+    struct inkling2_layer {
+        ggml_tensor * wk_ctx      = nullptr;
+        ggml_tensor * wv_ctx      = nullptr;
+        ggml_tensor * k_ctx_norm  = nullptr;
+        ggml_tensor * dflare_norm = nullptr; // norm of the layer's feature mix
+    };
+    std::vector<inkling2_layer> ink_layers;
+    ggml_tensor * ink_fuse         = nullptr; // [n_tap, n_layer + 1] mix logits, the last row for the markov head
+    ggml_tensor * ink_norm         = nullptr; // norm of the markov head's feature mix
+    ggml_tensor * ink_mask         = nullptr; // [n_embd] the embedding of every mask slot
+    ggml_tensor * ink_hidden_out   = nullptr; // [rank, n_embd] markov latent -> hidden correction
+    ggml_tensor * ink_hidden_out_b = nullptr;
+
+    // the markov correction folded into the target's lm head (rows of the unpadded vocab): lm_head*hidden_out
+    // [rank, n_vocab] F16 and lm_head*hidden_out_b [n_vocab] F32, made on the lm head's device by init_ctx_other;
+    // without them the graph runs the lm head once per draft step
+    mutable ggml_context_ptr        ink_fold_ctx;
+    mutable ggml_backend_buffer_ptr ink_fold_buf;
+    mutable ggml_tensor *       ink_fold_w    = nullptr;
+    mutable ggml_tensor *       ink_fold_b    = nullptr;
+    mutable const ggml_tensor * ink_fold_head = nullptr; // the lm head they were folded from
+
+    void init_ctx_other(const llama_model & model_other, const std::vector<ggml_backend_t> & backends) const override;
 
     void load_hparams_lilicorr(llama_model_loader & ml);
     void load_hparams_dsv4(llama_model_loader & ml);
@@ -1662,6 +1688,7 @@ struct llama_model_dflash : public llama_model_base {
     void load_tensors_layers_base();
     void load_tensors_layers_dsv4();
     void load_tensors_layers_mistral_large4();
+    void load_tensors_inkling2();
 
     template <bool is_enc>
     struct graph : public llm_graph_context {
@@ -1722,8 +1749,20 @@ struct llama_model_dflash : public llama_model_base {
         graph_mistral_large4(const llm_graph_params & params);
     };
 
+    // Inkling2 DSpark: per-layer DFlare feature mixes as context K/V, normalized target embedding of the anchor,
+    // recurrent markov head over [state, prev, hidden, f_rnn] whose latent corrects the hidden state before the lm head
+    struct graph_inkling2 : public graph_base {
+        graph_inkling2(const llm_graph_params & params);
+
+        // alpha-weighted sum of the taps of feat [n_embd, n_tap, n] with row r of the softmaxed mix logits
+        ggml_tensor * mix_taps(ggml_tensor * feat, ggml_tensor * alpha, int r);
+        void build_inject_inkling2();
+        void build_block_inkling2();
+    };
+
     // graph helpers shared by the backbones
     static ggml_tensor * build_inject_inp(llm_graph_context & g, const llama_model & model);
+    static ggml_tensor * build_inp_target_features(llm_graph_context & g, llm_graph_input_embd & inp, int64_t n_embd_inp);
     static ggml_tensor * get_tok_embd(const llm_graph_context & g, const llama_model & model);
     static std::pair<ggml_tensor *, ggml_tensor *> get_lm_head(const llm_graph_context & g, const llama_model & model);
 

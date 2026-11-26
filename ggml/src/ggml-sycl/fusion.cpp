@@ -143,6 +143,22 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         return ggml_sycl_can_fuse(cgraph, node_idx + 1, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {});
     }
 
+    // MUL_MAT -> GATE_MIX -> RMS_NORM -> MUL: the matmul result is the gains|forgets of the mix (its src[2], of
+    // another shape, so not a ggml_can_fuse chain) and used nowhere else; its f32 bytes are never written (f16 in
+    // a scratch buffer), the mix -> norm -> mul chain as below
+    if (ops.size() == 4 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_GATE_MIX &&
+        ops.begin()[2] == GGML_OP_RMS_NORM && ops.begin()[3] == GGML_OP_MUL) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 }) ||
+            !ggml_can_fuse(cgraph, node_idx + 1, { GGML_OP_GATE_MIX, GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            return false;
+        }
+        const ggml_tensor * mm  = cgraph->nodes[node_idx];
+        const ggml_tensor * mix = cgraph->nodes[node_idx + 1];
+        return mix->src[2] == mm && mix->src[0] != mm && mix->src[1] != mm && mm->type == GGML_TYPE_F32 &&
+               ggml_is_contiguous(mm) && mm->ne[2] == 1 && mm->ne[3] == 1 && mm->ne[0] == 2*mix->ne[0] &&
+               mm->ne[1] == ggml_nrows(mix);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -352,6 +368,13 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
             return false;
         }
 
+        return true;
+    }
+
+    // GATE_MIX -> RMS_NORM -> MUL: ggml_can_fuse() pinned the chain and the single uses; the shape, type and
+    // alignment checks are in ggml_sycl_op_gate_mix_rms_norm_mul(), which declines (nothing queued) otherwise
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_GATE_MIX && ops.begin()[1] == GGML_OP_RMS_NORM &&
+        ops.begin()[2] == GGML_OP_MUL) {
         return true;
     }
 

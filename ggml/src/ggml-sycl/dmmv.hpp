@@ -33,4 +33,45 @@ bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(
     const void * vx, const void * vgate, const float * y,
     float * dst, int ncols, int nrows, dpct::queue_ptr stream);
 
+// One-column products of up to GGML_SYCL_DMMV_MULTI_MAX reordered Q4_K / Q6_K weights that share the activation y
+// and the row length (a multiple of 768), in one launch. A work-group owns two rows of one weight; each of its
+// ncols/768 threads keeps its 768-float slice of y in registers and reads the three contiguous blocks of each row.
+constexpr int GGML_SYCL_DMMV_MULTI_MAX = 4;
+
+struct ggml_sycl_dmmv_multi_seg {
+    const void *  w;      // reordered weight
+    float *       dst;    // [nrows]
+    int           nrows;
+    int           type;   // GGML_TYPE_Q4_K or GGML_TYPE_Q6_K
+};
+
+struct ggml_sycl_dmmv_multi_args {
+    ggml_sycl_dmmv_multi_seg seg[GGML_SYCL_DMMV_MULTI_MAX];
+    int                      nseg;
+    // columns (0 or 1: one): column c reads y + c * y_stride and writes dst + c * dst_stride (floats) of each
+    // segment, through the work-groups of the one-column launch
+    int                      ncol;
+    size_t                   y_stride;
+    size_t                   dst_stride;
+};
+
+// A request for the next one-column reordered ESIMD DMMV (Q4_K, Q5_K, Q6_K, row pairs) whose activation and result
+// are y0 and dst0: run it over ncol columns at y0 + c * y_stride and dst0 + c * dst_stride (floats) in one launch,
+// each column as the one-column launch computes it, and set used. Set by the row-exact verify (ggml-sycl.cpp) around
+// a one-column ggml_sycl_mul_mat, so the column takes the dispatch of the one-token decode.
+struct ggml_sycl_dmmv_nc_req {
+    const float * y0;
+    float *       dst0;
+    int           ncol;
+    size_t        y_stride;
+    size_t        dst_stride;
+    bool          used;
+};
+extern thread_local ggml_sycl_dmmv_nc_req g_ggml_sycl_dmmv_nc;
+
+// every segment of one launch has the same type (the kernel is specialised on it)
+// false if the shape or a type is not covered (nothing is launched then)
+bool ggml_sycl_dmmv_multi(const ggml_sycl_dmmv_multi_args & args, const float * y, int ncols, dpct::queue_ptr stream);
+bool ggml_sycl_dmmv_multi_supported(int type, int64_t ncols);
+
 #endif // GGML_SYCL_DMMV_HPP

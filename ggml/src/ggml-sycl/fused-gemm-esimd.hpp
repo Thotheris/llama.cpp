@@ -11,6 +11,7 @@
 // `reordered`, else in the canonical block layout. Returns false when the shape is not covered.
 template <typename block_q_t>
 constexpr bool ggml_sycl_grouped_gemm_esimd_has = std::is_same_v<block_q_t, block_q8_0> ||
+                                                  std::is_same_v<block_q_t, block_q5_0> ||
                                                   std::is_same_v<block_q_t, block_iq4_nl> ||
                                                   std::is_same_v<block_q_t, block_iq4_xs> ||
                                                   std::is_same_v<block_q_t, block_iq3_s> ||
@@ -25,7 +26,8 @@ template <typename block_q_t, typename T, int NW>
 bool ggml_sycl_grouped_gemm_esimd(const char * src0_dd, size_t expert_stride, const ggml_sycl_grouped_gemm_tile * tiles,
                                   const T * packed, float * dst, int M, int Npad, int K,
                                   const ggml_sycl_grouped_gemm_rows & dst_rows, bool reordered, int64_t n_tiles,
-                                  dpct::queue_ptr stream);
+                                  dpct::queue_ptr stream, const uint32_t * expert_offsets = nullptr,
+                                  const ggml_sycl_grouped_gemm_situ_out * epi = nullptr);
 
 // GGML_SYCL_MMID_ESIMD: 1 (default) takes the ESIMD kernel above where it applies, 0 never does
 bool ggml_sycl_grouped_gemm_esimd_enabled();

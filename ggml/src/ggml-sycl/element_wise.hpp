@@ -132,6 +132,12 @@ void ggml_sycl_arange(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 // fused UNARY(silu|sigmoid|softplus) + MUL; see ggml_sycl_can_fuse() for the accepted shapes
 void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+// the same for contiguous f32 tensors, also writing the f16 copy of the result into the dense oneDNN activation
+// cache (dense-dnn.hpp); false (nothing queued) when the shapes do not qualify or no slot is available
+// pin_until >= 0 (GGML_SYCL_DROP_F32): only the f16 copy is written, pinned in the cache until node pin_until
+bool ggml_sycl_op_unary_mul_fused_f16(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
+                                      int pin_until = -1);
+
 // fused f32 ADD + UNARY(silu|sigmoid|softplus) + MUL with the bias and the scale broadcast
 // over dim 0; see ggml_sycl_can_fuse() for the accepted shapes
 void ggml_sycl_op_add_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add_node,

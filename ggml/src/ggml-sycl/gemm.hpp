@@ -56,6 +56,11 @@ public:
         const auto c_md    = dnnl::memory::desc(c_dims, ct, c_strides);
         dnnl::primitive_attr primitive_attr;
         primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+#if DNNL_VERSION_MAJOR > 3 || (DNNL_VERSION_MAJOR == 3 && DNNL_VERSION_MINOR >= 4)
+        // without it oneDNN may split K over work-groups and sum the parts with atomics for a short wide
+        // problem (B70: m 384, n 512, k 2304), so the same prompt gave different rounding run to run
+        primitive_attr.set_deterministic(true);
+#endif
 
 #ifdef GGML_SYCL_F16
         primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);

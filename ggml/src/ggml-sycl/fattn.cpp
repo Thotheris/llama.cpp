@@ -94,6 +94,11 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     GGML_ABORT("Not match KV type in vec");
 }
 
+// the op has a mask per query head or the rel-bias table of ggml_flash_attn_ext_set_rel_bias
+static bool ggml_sycl_fattn_is_head_or_rel(const ggml_tensor * dst) {
+    return dst->src[6] != nullptr || (dst->src[3] != nullptr && dst->src[3]->ne[2] > 1);
+}
+
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
@@ -112,6 +117,11 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 #endif// SYCL_FLASH_ATTN
 
     if(!g_ggml_sycl_enable_flash_attention) return BEST_FATTN_KERNEL_NONE;
+
+    // a per-head mask or the rel-bias table (ggml_flash_attn_ext_set_rel_bias): only the f16 DPAS kernels read them
+    if (ggml_sycl_fattn_is_head_or_rel(dst)) {
+        return ggml_sycl_flash_attn_ext_dpas_supported(device, dst) ? BEST_FATTN_KERNEL_DPAS : BEST_FATTN_KERNEL_NONE;
+    }
 
     const ggml_tensor * KQV   = dst;
     const ggml_tensor * Q     = dst->src[0];
@@ -443,6 +453,10 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     if (!Q || !K || !V) {
+        return extra;
+    }
+    // the f16 DPAS kernels of these ops read K/V in place and take their scratch from the pool
+    if (ggml_sycl_fattn_is_head_or_rel(dst)) {
         return extra;
     }
 

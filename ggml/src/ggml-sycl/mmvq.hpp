@@ -120,4 +120,13 @@ bool ggml_sycl_mul_mat_vec_q_glu_plain(
 bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type);
 bool ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(enum ggml_type src0_type);
 
+// The fused MoE expert GEMV of a row-exact verify over R routes grouped by expert (mmvq.cpp): each route as the
+// one-token kernel (ggml_sycl_mul_mat_vec_q_id[_reorder]) computes it, the expert blocks read once per group.
+// grp: [R] expert, [R] first slot, [R] slot count of each group (count 0: none); at most 8 slots per group.
+bool ggml_sycl_mul_mat_vec_q_id_grouped_supports(enum ggml_type src0_type, bool reorder);
+bool ggml_sycl_mul_mat_vec_q_id_grouped(enum ggml_type src0_type, bool reorder, const void * vx_base, const void * vy,
+                                        const int32_t * grp, float * dst_base, int ncols, int nrows, int R,
+                                        size_t expert_weight_stride, size_t dst_row_stride, size_t src1_row_stride,
+                                        dpct::queue_ptr stream);
+
 #endif // GGML_SYCL_MMVQ_HPP

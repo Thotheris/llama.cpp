@@ -2740,6 +2740,127 @@ static void launch_mul_mat_vec_q_moe(
     });
 }
 
+// The q5_0 MoE GEMV (GGML_SYCL_Q5_0_MOE_GEMV, default on): a sub-group takes WARP_SIZE / LPR rows, LPR lanes a row,
+// and a lane whole 22-byte blocks j, j + LPR, ... of its row, so all lanes stay busy when the row's block count BPR is
+// a multiple of LPR (the plain kernel above runs 2 lanes a block, 8 blocks an iteration, and 36 blocks leave the last iteration
+// half idle). A block is read as 6 dwords from the dword at or below it and realigned by its parity (an odd block
+// starts 2 bytes into a dword; rows are 4-byte aligned since BPR is even), instead of 2-byte loads. The per-block
+// arithmetic is vec_dot_q5_0_q8_1_impl's over the whole block; the LPR lanes of a row are summed in a fixed order.
+template <int BPR, int LPR>
+static void mul_mat_vec_q5_0_moe_r4(const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+                                    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
+                                    const int nrows, const size_t expert_weight_stride, const size_t dst_row_stride,
+                                    const size_t src1_row_stride, const sycl::nd_item<3> & item_ct1) {
+    static_assert(BPR % LPR == 0 && LPR % 2 == 0 && BPR % 2 == 0 && sizeof(block_q5_0) == 22, "");
+    constexpr int RPS = WARP_SIZE / LPR;  // rows a sub-group
+    const int  expert_idx = item_ct1.get_group(1);
+    const int  i02        = ids_dev[expert_idx];
+    const auto sg         = item_ct1.get_sub_group();
+    const int  lane       = sg.get_local_linear_id();
+    const int  row = (item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1)) * RPS + lane / LPR;
+
+    const char * vy  = (const char *) vy_base + (size_t) expert_idx * src1_row_stride;
+    float *      dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
+
+    if (i02 == -1) {  // skipped slot (uniform over the work-group)
+        if (lane % LPR == 0 && row < nrows) {
+            dst[row] = 0.0f;
+        }
+        return;
+    }
+    // rows past the end read the last one, so every lane takes part in the shuffles
+    const int    rr = sycl::min(row, nrows - 1);
+    const char * xr = (const char *) vx_base + (size_t) i02 * expert_weight_stride + (size_t) rr * (BPR * 22);
+    const block_q8_1 * y   = (const block_q8_1 *) vy;
+    const bool         odd = (lane & 1) != 0;  // block lane % LPR + LPR i has the parity of lane
+
+    float tmp = 0.0f;
+#pragma unroll
+    for (int i = 0; i < BPR / LPR; ++i) {
+        const int        b = lane % LPR + LPR * i;
+        const uint32_t * w = (const uint32_t *) (xr + (size_t) (b * 22 - (odd ? 2 : 0)));
+        uint32_t         wv[6];
+#pragma unroll
+        for (int k = 0; k < 6; ++k) {
+            wv[k] = w[k];
+        }
+        auto fun = [&](int k) { return (wv[k] >> 16) | (wv[k + 1] << 16); };
+        const uint16_t dbits = (uint16_t) (odd ? (wv[0] >> 16) : (wv[0] & 0xFFFFu));
+        const uint32_t qh    = odd ? wv[1] : fun(0);
+        int            vl[4], vh[4], u[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            vl[j] = (int) (odd ? wv[2 + j] : fun(1 + j));
+            vh[j] = (int) (qh >> (4 * j));
+        }
+        const int * yq = (const int *) y[b].qs;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            u[2 * j + 0] = yq[j];
+            u[2 * j + 1] = yq[j + QI5_0];
+        }
+        const float d5 = sycl::bit_cast<sycl::half>(dbits);
+        tmp += vec_dot_q5_0_q8_1_impl<QI5_0>(vl, vh, u, d5, y[b].ds);
+    }
+#pragma unroll
+    for (int mask = 1; mask < LPR; mask <<= 1) {
+        tmp += dpct::permute_sub_group_by_xor(sg, tmp, mask);
+    }
+    if (lane % LPR == 0 && row < nrows) {
+        dst[row] = tmp;
+    }
+}
+
+static bool q5_0_moe_gemv_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_SYCL_Q5_0_MOE_GEMV");
+        return !e || atoi(e) != 0;
+    }();
+    return v;
+}
+
+// true when the q5_0 MoE GEMV above took the call
+static bool launch_mul_mat_vec_q5_0_moe_r4(const void * vx_base, const void * vy, const int32_t * ids_dev,
+                                           float * dst_base, const int ncols, const int nrows,
+                                           const int n_experts_used, const size_t expert_weight_stride,
+                                           const size_t dst_row_stride, const size_t src1_row_stride,
+                                           dpct::queue_ptr stream) {
+    if (!q5_0_moe_gemv_enabled() || (uintptr_t) vx_base % 4 != 0 || expert_weight_stride % 4 != 0 ||
+        (uintptr_t) vy % 4 != 0 || src1_row_stride % 4 != 0) {
+        return false;
+    }
+    // B70, Inkling decode (K 1152): 4 lanes a row 31 us a call, 2 lanes 38 (the plain kernel 37.4); 2, 4 or 8
+    // sub-groups a work-group within 1 us
+    auto go = [&](auto bc) {
+        constexpr int        BPR = decltype(bc)::value;
+        constexpr int        LPR = 4;
+        constexpr int        RPS = WARP_SIZE / LPR;
+        constexpr int        NSG = 2;  // sub-groups (RPS rows each) a work-group
+        const int            block_num_y = (nrows + RPS * NSG - 1) / (RPS * NSG);
+        const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) block_num_y);
+        const sycl::range<3> block_dims(1, NSG, WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 mul_mat_vec_q5_0_moe_r4<BPR, LPR>(vx_base, vy, dst_base, ids_dev, nrows,
+                                                              expert_weight_stride, dst_row_stride, src1_row_stride,
+                                                              item);
+                             });
+        });
+        return true;
+    };
+    static_assert(WARP_SIZE == 16, "4 rows of 4 lanes a sub-group of 16");
+    if (ncols % QK5_0 != 0) {
+        return false;
+    }
+    switch (ncols / QK5_0) {
+        case 36: return go(std::integral_constant<int, 36>{});
+        case 64: return go(std::integral_constant<int, 64>{});
+        case 72: return go(std::integral_constant<int, 72>{});
+        default: return false;
+    }
+}
+
 bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type) {
     switch (src0_type) {
         case GGML_TYPE_Q4_0:
@@ -2812,6 +2933,10 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
         case GGML_TYPE_Q5_0:
+            if (launch_mul_mat_vec_q5_0_moe_r4(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                                               expert_weight_stride, dst_row_stride, src1_row_stride, stream)) {
+                return true;
+            }
             launch_mul_mat_vec_q_moe<QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
@@ -3337,6 +3462,282 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
             // fusion declines q5_K past 5 columns
             return mul_mat_vec_q_glu_reorder_ncols<GGML_TYPE_Q5_K, 1, 2, 3, 4, 5>(
                 glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, stream);
+        default:
+            return false;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Grouped MoE expert GEMV of a row-exact verify (ggml-sycl.cpp, ggml_sycl_row_exact_moe_flat): the routes of the n
+// tokens sorted by expert, a work-group row of each group of routes that share an expert, the expert's blocks read
+// once for the group's routes. Each route keeps the partial sum, the block order and the sub-group reduction of the
+// one-token kernel above (mul_mat_vec_q_moe_reorder, mul_mat_vec_q_moe), so its result is the one-token result.
+// grp[0..R): expert of group g, grp[R..2R): first slot, grp[2R..3R): slot count (0: no group). Slot p reads
+// vy_base + p * src1_row_stride and writes dst_base + p * dst_row_stride.
+// ---------------------------------------------------------------------------------------------------------------
+constexpr int MOE_GROUPED_CMAX = 8;
+
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_moe_reorder_grouped(const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+                                              float * __restrict__ dst_base, const int32_t * __restrict__ grp,
+                                              const int R, const int ncols, const int nrows,
+                                              const size_t expert_weight_stride, const size_t dst_row_stride,
+                                              const size_t src1_row_stride, const sycl::nd_item<3> & item_ct1) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const int g   = item_ct1.get_group(1);
+    const int cnt = grp[2 * R + g];
+    if (cnt == 0) {
+        return;
+    }
+    const int i02 = grp[g];
+    const int p0  = grp[R + g];
+
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    if (row >= nrows) {
+        return;
+    }
+
+    const auto sg = item_ct1.get_sub_group();
+
+    if (i02 == -1) { // skipped slots
+        if (sg.leader()) {
+            for (int c = 0; c < cnt; ++c) {
+                ((float *) ((char *) dst_base + (size_t) (p0 + c) * dst_row_stride))[row] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const char * vx = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+
+    constexpr int vdr_mmvq = reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0 ?
+                            VDR_Q8_0_Q8_1_MMVQ : block_traits::vdr_mmvq;
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / vdr_mmvq;
+    const int     nblocks                     = nrows * (ncols / block_traits::qk);
+
+    float partial_sum[MOE_GROUPED_CMAX];
+#pragma unroll
+    for (int c = 0; c < MOE_GROUPED_CMAX; ++c) {
+        partial_sum[c] = 0.0f;
+    }
+    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
+        const int ibx = row * blocks_per_row + i;
+
+        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        const int  iby       = i * block_type::block_to_q8_1_ratio();
+
+        if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q4_K) {
+            // the weight half of the dot (reorder_vec_dot_q_sycl<Q4_K>::operator() is dot(load(...))) once per block
+#pragma unroll
+            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                const int  iqs = elem + vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+                const auto wq  = reorder_vec_dot_q_sycl::load(vx, bx_offset, d_offset, iqs);
+#pragma unroll
+                for (int c = 0; c < MOE_GROUPED_CMAX; ++c) {
+                    if (c < cnt) {
+                        const char *        vy             = (const char *) vy_base + (size_t) (p0 + c) * src1_row_stride;
+                        const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+                        const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+                        partial_sum[c] += reorder_vec_dot_q_sycl::dot(wq, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                    }
+                }
+            }
+            continue;
+        }
+#pragma unroll
+        for (int c = 0; c < MOE_GROUPED_CMAX; ++c) {
+            if (c < cnt) {
+                const char *        vy             = (const char *) vy_base + (size_t) (p0 + c) * src1_row_stride;
+                const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+                const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+#pragma unroll
+                for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                    const int iqs = elem + vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+                    if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
+                        partial_sum[c] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs, vdr_mmvq);
+                    } else {
+                        partial_sum[c] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < MOE_GROUPED_CMAX; ++c) {
+        if (c < cnt) {
+            float sum = partial_sum[c];
+            if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
+                for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+                    sum += dpct::permute_sub_group_by_xor(sg, sum, mask);
+                }
+            } else {
+                sum = sycl::reduce_over_group(sg, partial_sum[c], std::plus<>());
+            }
+            if (sg.leader()) {
+                ((float *) ((char *) dst_base + (size_t) (p0 + c) * dst_row_stride))[row] = sum;
+            }
+        }
+    }
+}
+
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
+static void mul_mat_vec_q_moe_grouped(const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+                                      float * __restrict__ dst_base, const int32_t * __restrict__ grp, const int R,
+                                      const int ncols, const int nrows, const size_t expert_weight_stride,
+                                      const size_t dst_row_stride, const size_t src1_row_stride,
+                                      const sycl::nd_item<3> & item_ct1) {
+    const int g   = item_ct1.get_group(1);
+    const int cnt = grp[2 * R + g];
+    if (cnt == 0) {
+        return;
+    }
+    const int i02 = grp[g];
+    const int p0  = grp[R + g];
+
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    if (row >= nrows) {
+        return;
+    }
+
+    if (i02 == -1) { // skipped slots
+        if (item_ct1.get_local_id(2) == 0) {
+            for (int c = 0; c < cnt; ++c) {
+                ((float *) ((char *) dst_base + (size_t) (p0 + c) * dst_row_stride))[row] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const char * vx = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+
+    const int     blocks_per_row  = ncols / qk;
+    constexpr int blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;
+
+    float tmp[MOE_GROUPED_CMAX];
+#pragma unroll
+    for (int c = 0; c < MOE_GROUPED_CMAX; ++c) {
+        tmp[c] = 0.0f;
+    }
+
+    const block_q_t * x = (const block_q_t *) vx;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row * blocks_per_row + i;
+        const int iby = i * (qk / QK8_1);
+
+#pragma unroll
+        for (int c = 0; c < MOE_GROUPED_CMAX; ++c) {
+            if (c < cnt) {
+                const block_q8_1 * y = (const block_q8_1 *) ((const char *) vy_base + (size_t) (p0 + c) * src1_row_stride);
+                for (size_t elem = 0; elem < qi / vdr; elem += WARP_SIZE) {
+                    const int iqs = elem + vdr * (item_ct1.get_local_id(2) % (qi / vdr));
+                    tmp[c] += vec_dot_q_sycl(&x[ibx], &y[iby], iqs);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < MOE_GROUPED_CMAX; ++c) {
+        if (c < cnt) {
+            float t = tmp[c];
+#pragma unroll
+            for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+                t += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), t, mask);
+            }
+            if (item_ct1.get_local_id(2) == 0) {
+                ((float *) ((char *) dst_base + (size_t) (p0 + c) * dst_row_stride))[row] = t;
+            }
+        }
+    }
+}
+
+template <typename reorder_vec_dot_q_sycl>
+static void launch_mul_mat_vec_q_moe_reorder_grouped(const void * vx_base, const void * vy, const int32_t * grp,
+                                                     float * dst_base, const int ncols, const int nrows, const int R,
+                                                     const size_t expert_weight_stride, const size_t dst_row_stride,
+                                                     const size_t src1_row_stride, dpct::queue_ptr stream) {
+    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, (unsigned) R, (unsigned) block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q_moe_reorder_grouped<reorder_vec_dot_q_sycl>(
+                                 vx_base, vy, dst_base, grp, R, ncols, nrows, expert_weight_stride, dst_row_stride,
+                                 src1_row_stride, item);
+                         });
+    });
+}
+
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
+static void launch_mul_mat_vec_q_moe_grouped(const void * vx_base, const void * vy, const int32_t * grp,
+                                             float * dst_base, const int ncols, const int nrows, const int R,
+                                             const size_t expert_weight_stride, const size_t dst_row_stride,
+                                             const size_t src1_row_stride, dpct::queue_ptr stream) {
+    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, (unsigned) R, (unsigned) block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q_moe_grouped<qk, qi, block_q_t, vdr, vec_dot_q_sycl>(
+                                 vx_base, vy, dst_base, grp, R, ncols, nrows, expert_weight_stride, dst_row_stride,
+                                 src1_row_stride, item);
+                         });
+    });
+}
+
+bool ggml_sycl_mul_mat_vec_q_id_grouped_supports(enum ggml_type src0_type, bool reorder) {
+    if (reorder) {
+        return src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K ||
+               src0_type == GGML_TYPE_Q6_K;
+    }
+    // not Q5_0: its 1-token MoE GEMV may be the whole-block-lane kernel (GGML_SYCL_Q5_0_MOE_GEMV), whose sum order the
+    // grouped kernel does not follow; the flat route then runs the 1-token launcher itself and stays row-exact
+    return src0_type == GGML_TYPE_Q4_0 || src0_type == GGML_TYPE_Q8_0;
+}
+
+bool ggml_sycl_mul_mat_vec_q_id_grouped(enum ggml_type src0_type, bool reorder, const void * vx_base, const void * vy,
+                                        const int32_t * grp, float * dst_base, int ncols, int nrows, int R,
+                                        size_t expert_weight_stride, size_t dst_row_stride, size_t src1_row_stride,
+                                        dpct::queue_ptr stream) {
+    if (!ggml_sycl_mul_mat_vec_q_id_grouped_supports(src0_type, reorder)) {
+        return false;
+    }
+#define GROUPED_REORDER(T)                                                                                          \
+    launch_mul_mat_vec_q_moe_reorder_grouped<reorder_vec_dot_q_sycl<T>>(vx_base, vy, grp, dst_base, ncols, nrows, R, \
+                                                                       expert_weight_stride, dst_row_stride,        \
+                                                                       src1_row_stride, stream)
+    if (reorder) {
+        switch (src0_type) {
+            case GGML_TYPE_Q8_0: GROUPED_REORDER(GGML_TYPE_Q8_0); return true;
+            case GGML_TYPE_Q4_K: GROUPED_REORDER(GGML_TYPE_Q4_K); return true;
+            case GGML_TYPE_Q5_K: GROUPED_REORDER(GGML_TYPE_Q5_K); return true;
+            case GGML_TYPE_Q6_K: GROUPED_REORDER(GGML_TYPE_Q6_K); return true;
+            default: return false;
+        }
+    }
+#undef GROUPED_REORDER
+    switch (src0_type) {
+        case GGML_TYPE_Q4_0:
+            launch_mul_mat_vec_q_moe_grouped<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
+                vx_base, vy, grp, dst_base, ncols, nrows, R, expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_Q5_0:
+            launch_mul_mat_vec_q_moe_grouped<QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>(
+                vx_base, vy, grp, dst_base, ncols, nrows, R, expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
+        case GGML_TYPE_Q8_0:
+            launch_mul_mat_vec_q_moe_grouped<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
+                vx_base, vy, grp, dst_base, ncols, nrows, R, expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            return true;
         default:
             return false;
     }

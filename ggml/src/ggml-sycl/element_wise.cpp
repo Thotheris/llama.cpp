@@ -2,6 +2,7 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml.h"
 #include "element_wise.hpp"
+#include "dense-dnn.hpp"
 
 #define SYCL_GLOBAL_ID_LOOP(K, ITEM) \
     for (auto i = ITEM.get_global_id(0); i < (size_t)K; i += ITEM.get_global_range(0))
@@ -1062,6 +1063,84 @@ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
     };
 
     dispatch_fused_unary_op(ggml_get_unary_op(unary_node), dispatch_type);
+}
+
+// the flat f32 form above that also writes the f16 copy of the result (round to nearest even, the conversion of
+// the oneDNN reorder) for the dense matmuls that read it; false (nothing queued) when the shapes do not qualify
+// pin_until >= 0 (GGML_SYCL_DROP_F32): only the f16 copy is written, pinned in the cache until node pin_until
+bool ggml_sycl_op_unary_mul_fused_f16(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
+                                      int pin_until) {
+#if !GGML_SYCL_DNNL
+    GGML_UNUSED(ctx); GGML_UNUSED(unary_node); GGML_UNUSED(mul_node); GGML_UNUSED(pin_until);
+    return false;
+#else
+    const ggml_tensor * x = unary_node->src[0];
+    const ggml_tensor * g = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+    if (mul_node->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(g) || !ggml_is_contiguous(mul_node) ||
+        !ggml_are_same_shape(x, mul_node) || !ggml_are_same_shape(g, mul_node)) {
+        return false;
+    }
+    // registered only now that the kernel is sure to run
+    sycl::half * dst_h  = pin_until >= 0 ? ggml_sycl_dense_dnn_act_reserve(ctx, mul_node, pin_until) : nullptr;
+    const bool   no_f32 = dst_h != nullptr;
+    if (!dst_h) {
+        dst_h = ggml_sycl_dense_dnn_act_reserve(ctx, mul_node);
+    }
+    if (!dst_h) {
+        return false;
+    }
+    scope_op_debug_print scope_dbg_print(__func__, mul_node, /*num_src=*/2);
+    queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    const int64_t k  = ggml_nelements(mul_node);
+    const float * xd = (const float *) x->data;
+    const float * gd = (const float *) g->data;
+    float *       dd = (float *) mul_node->data;
+    // float4 units (GGML_SYCL_UNARY_MUL_VEC=0: the scalar kernel); the same arithmetic per element
+    static const bool vec_on = ggml_sycl_get_env("GGML_SYCL_UNARY_MUL_VEC", 1) != 0;
+    const bool vec = vec_on && k % 4 == 0 && ((uintptr_t) xd % 16) == 0 && ((uintptr_t) gd % 16) == 0 &&
+                     ((uintptr_t) dd % 16) == 0 && ((uintptr_t) dst_h % 8) == 0;
+    const auto launch = [&](auto op) {
+        if (vec) {
+            const int64_t           k4         = k / 4;
+            const size_t            num_blocks = ceil_div((size_t) k4, (size_t) SYCL_GLU_BLOCK_SIZE);
+            const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
+            main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const int64_t i = item_ct1.get_global_id(0);
+                if (i >= k4) {
+                    return;
+                }
+                const sycl::float4 xv = ((const sycl::float4 *) xd)[i];
+                const sycl::float4 gv = ((const sycl::float4 *) gd)[i];
+                sycl::float4 v;
+                v.x() = op(xv.x()) * gv.x();
+                v.y() = op(xv.y()) * gv.y();
+                v.z() = op(xv.z()) * gv.z();
+                v.w() = op(xv.w()) * gv.w();
+                if (!no_f32) {
+                    ((sycl::float4 *) dd)[i] = v;
+                }
+                ((sycl::vec<sycl::half, 4> *) dst_h)[i] = v.convert<sycl::half, sycl::rounding_mode::rte>();
+            });
+            return;
+        }
+        const size_t            num_blocks = ceil_div((size_t) k, (size_t) SYCL_GLU_BLOCK_SIZE);
+        const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
+        main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
+                const float v = op(xd[i]) * gd[i];
+                if (!no_f32) {
+                    dd[i] = v;
+                }
+                dst_h[i] = sycl::vec<float, 1>(v).convert<sycl::half, sycl::rounding_mode::rte>()[0];
+            }
+        });
+    };
+    dispatch_fused_unary_op(ggml_get_unary_op(unary_node), launch);
+    return true;
+#endif
 }
 
 // dst = op(a + bias) * scale for an ADD + UNARY + MUL chain whose bias and scale broadcast

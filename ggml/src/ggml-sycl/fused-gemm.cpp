@@ -399,6 +399,7 @@ template <> struct fg_block_traits<block_iq2_s>   { static constexpr int qk = QK
 template <> struct fg_block_traits<block_iq1_s>   { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_iq1_m>   { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q8_0>    { static constexpr int qk = QK8_0; };
+template <> struct fg_block_traits<block_q5_0>    { static constexpr int qk = QK5_0; };
 template <> struct fg_block_traits<block_q2_K>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q3_K>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q4_K>    { static constexpr int qk = QK_K; };
@@ -693,6 +694,25 @@ static __dpct_inline__ void fg_decode_q6_K(const uint8_t * __restrict__ ql, cons
 template <typename E>
 static __dpct_inline__ void fg_stage_a(const block_q8_0 * __restrict__ xrow, const int kb, typename E::pair * a) {
     fg_decode_q8_0<E>(xrow[kb].qs, (float) xrow[kb].d, a);
+}
+
+// q5_0: value k < 16 is the low nibble of qs[k], value 16 + k its high nibble, each with bit k
+// (16 + k) of qh as 16, minus 16, times d: dequantize_q5_0. The block is 22 bytes, so qh is read
+// bytewise.
+template <typename E>
+static __dpct_inline__ void fg_stage_a(const block_q5_0 * __restrict__ xrow, const int kb, typename E::pair * a) {
+    const block_q5_0 * blk = xrow + kb;
+    const float        d   = (float) blk->d;
+    const uint32_t     qh  = blk->qh[0] | (blk->qh[1] << 8) | (blk->qh[2] << 16) | ((uint32_t) blk->qh[3] << 24);
+#pragma unroll
+    for (int j = 0; j < QK5_0 / 2; j += 2) {
+        const uint8_t q0 = blk->qs[j];
+        const uint8_t q1 = blk->qs[j + 1];
+        a[j / 2]     = E::make(d * ((int) ((q0 & 0xf) | (((qh >> j) & 1) << 4)) - 16),
+                               d * ((int) ((q1 & 0xf) | (((qh >> (j + 1)) & 1) << 4)) - 16));
+        a[j / 2 + 8] = E::make(d * ((int) ((q0 >> 4) | (((qh >> (j + 16)) & 1) << 4)) - 16),
+                               d * ((int) ((q1 >> 4) | (((qh >> (j + 17)) & 1) << 4)) - 16));
+    }
 }
 
 template <typename E>
@@ -994,19 +1014,33 @@ static void fused_dequant_gemm_launch(const void * src0, const typename S::tsb *
 
 // grouped: work-group (t, mt) is tile t of the schedule; its B columns sit at t * BN
 template <typename S, typename block_q_t, bool reordered>
-static void grouped_dequant_gemm_launch(const char * src0_dd, const size_t expert_stride,
+static bool grouped_dequant_gemm_launch(const char * src0_dd, const size_t expert_stride,
                                         const ggml_sycl_grouped_gemm_tile * tiles_ptr, const typename S::tsb * packed,
                                         float * dst, const int M, const int Npad, const int K, const int64_t n_tiles,
                                         const int64_t groups_m, dpct::queue_ptr stream,
-                                        ggml_sycl_grouped_gemm_rows dst_rows = {}) {
+                                        ggml_sycl_grouped_gemm_rows dst_rows = {},
+                                        const uint32_t * expert_offsets = nullptr,
+                                        const ggml_sycl_grouped_gemm_situ_out * epi = nullptr) {
     if constexpr (fg_esimd_combo<S>() && ggml_sycl_grouped_gemm_esimd_has<block_q_t>) {
+        if (epi) {
+            // the SiTU epilogue or nothing queued
+            return ggml_sycl_grouped_gemm_esimd_enabled() &&
+                   ggml_sycl_grouped_gemm_esimd<block_q_t, typename S::tsb, S::SG>(src0_dd, expert_stride, tiles_ptr,
+                                                                                   packed, dst, M, Npad, K, dst_rows,
+                                                                                   reordered, n_tiles, stream,
+                                                                                   expert_offsets, epi);
+        }
         // the register-operand ESIMD kernel, either weight layout: no SLM A image (GGML_SYCL_MMID_ESIMD)
         if (ggml_sycl_grouped_gemm_esimd_enabled() &&
             ggml_sycl_grouped_gemm_esimd<block_q_t, typename S::tsb, S::SG>(src0_dd, expert_stride, tiles_ptr, packed,
                                                                             dst, M, Npad, K, dst_rows, reordered,
-                                                                            n_tiles, stream)) {
-            return;
+                                                                            n_tiles, stream, expert_offsets)) {
+            return true;
         }
+    }
+    if (epi || dst_rows.w) {
+        // the epilogues are the ESIMD kernel's: nothing queued
+        return false;
     }
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<typename S::tsa, 1> tile_a(FG_KSPLIT * S::SG_ROWS * FG_BK, cgh);
@@ -1024,6 +1058,7 @@ static void grouped_dequant_gemm_launch(const char * src0_dd, const size_t exper
                                                                  tile.n1, tile_a, tile_c, item, dst_rows);
             });
     });
+    return true;
 }
 
 // src1 f32 rows -> packed [K/V][n_tiles*BN][V], tile t holds its rows [n0, n1) at columns t*BN..,
@@ -1057,10 +1092,11 @@ static void grouped_gemm_pack_b(const float * y, typename S::tsb * packed, const
     });
 }
 
-// q8_0 and the k-quants take only the grouped path. The plain kernel decodes A again for every BN columns
+// q5_0, q8_0 and the k-quants take only the grouped path. The plain kernel decodes A again for every BN columns
 // of a dense batch, and for these formats that costs more than the one dequantization of the library GEMM.
 template <typename T> static constexpr bool fg_plain_ok() {
-    return !std::is_same_v<T, block_q8_0> && !std::is_same_v<T, block_q2_K> && !std::is_same_v<T, block_q3_K> &&
+    return !std::is_same_v<T, block_q8_0> && !std::is_same_v<T, block_q5_0> && !std::is_same_v<T, block_q2_K> &&
+           !std::is_same_v<T, block_q3_K> &&
            !std::is_same_v<T, block_q4_K> && !std::is_same_v<T, block_q5_K> &&
            !std::is_same_v<T, block_q6_K>;
 }
@@ -1095,6 +1131,7 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered, 
         case GGML_TYPE_IQ1_S:   return fg_visit_layout<block_iq1_s>(reordered, f);
         case GGML_TYPE_IQ1_M:   return fg_visit_layout<block_iq1_m>(reordered, f);
         case GGML_TYPE_Q8_0:    return fg_visit_layout<block_q8_0>(reordered, f);
+        case GGML_TYPE_Q5_0:    return fg_visit_layout<block_q5_0>(reordered, f);
         case GGML_TYPE_Q2_K:    return fg_visit_layout<block_q2_K>(reordered, f);
         case GGML_TYPE_Q3_K:    return fg_visit_layout<block_q3_K>(reordered, f);
         case GGML_TYPE_Q4_K:    return fg_visit_layout<block_q4_K>(reordered, f);
@@ -1111,16 +1148,21 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered, 
 // among joint_matrix tiles.
 // A call the ESIMD kernel then declines (a shape it does not take) runs that combination's joint_matrix
 // kernel.
-static int fg_esimd_remap(dpct::queue_ptr stream, int combo, ggml_type src0_type, bool reordered) {
-    if (combo < 0 || !ggml_sycl_grouped_gemm_esimd_enabled()) {
-        return combo;
+// the ESIMD grouped GEMM is enabled and has a decode for this weight format and layout
+static bool fg_esimd_covers(ggml_type src0_type, bool reordered) {
+    if (!ggml_sycl_grouped_gemm_esimd_enabled()) {
+        return false;
     }
     bool covered = false;
     fg_visit_type(src0_type, reordered, [&](auto tag) {
         using T = decltype(tag);
         covered = ggml_sycl_grouped_gemm_esimd_has<typename T::type>;
     });
-    if (!covered) {
+    return covered;
+}
+
+static int fg_esimd_remap(dpct::queue_ptr stream, int combo, ggml_type src0_type, bool reordered) {
+    if (combo < 0 || !fg_esimd_covers(src0_type, reordered)) {
         return combo;
     }
     int target = -1;
@@ -1272,14 +1314,77 @@ bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, bool reordered, const v
 // One work-group sorts routes by expert and builds the tile table.
 static constexpr int MMID_SCHED_WG = 256;
 
+size_t ggml_sycl_mmid_schedule_scratch(int64_t n_as) {
+    return (size_t) MMID_SCHED_WG * n_as;
+}
+
 using mmid_sched_atomic = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
                                            sycl::memory_scope::work_group,
                                            sycl::access::address_space::local_space>;
 
+// The schedule's shared steps. The exclusive scan of cnt into off (with the total in off[n_as]):
+static inline void mmid_sched_scan(sycl::group<1> grp, int64_t tid, uint32_t * cnt, uint32_t * off, int64_t n_as) {
+    sycl::joint_exclusive_scan(grp, cnt, cnt + n_as, off, 0u, sycl::plus<uint32_t>());
+    sycl::group_barrier(grp);
+    if (tid == 0) {
+        off[n_as] = off[n_as - 1] + cnt[n_as - 1];
+    }
+    sycl::group_barrier(grp);
+}
+
+// The tile table from the expert offsets (cnt and toff are reused as the tile counts and their scan).
+static inline void mmid_sched_tiles(sycl::group<1> grp, int64_t tid, uint32_t * cnt, const uint32_t * off,
+                                    uint32_t * toff, int64_t n_as, int64_t n_tiles_max,
+                                    ggml_sycl_grouped_gemm_tile * tiles, uint32_t * expert_offsets) {
+    constexpr int WG = MMID_SCHED_WG;
+    for (int64_t e = tid; e < n_as; e += WG) {
+        cnt[e] = (off[e + 1] - off[e] + GGML_SYCL_FG_BN - 1) / GGML_SYCL_FG_BN;
+    }
+    sycl::group_barrier(grp);
+    mmid_sched_scan(grp, tid, cnt, toff, n_as);
+
+    const uint32_t n_tiles = toff[n_as];
+    for (int64_t e = tid; e < n_as; e += WG) {
+        const uint32_t base = off[e];
+        const uint32_t end  = off[e + 1];
+        for (uint32_t j = 0; j < cnt[e]; ++j) {
+            const uint32_t n0 = base + j * GGML_SYCL_FG_BN;
+            const uint32_t n1 = n0 + GGML_SYCL_FG_BN < end ? n0 + GGML_SYCL_FG_BN : end;
+            tiles[toff[e] + j] = { (int32_t) e, (int32_t) n0, (int32_t) n1 };
+        }
+    }
+    // the launch is bounded, so the unused tail must be tiles the GEMM skips
+    for (int64_t t = n_tiles + tid; t < n_tiles_max; t += WG) {
+        tiles[t] = { 0, 0, 0 };
+    }
+    for (int64_t e = tid; e <= n_as; e += WG) {
+        expert_offsets[e] = off[e];
+    }
+}
+
+// The SLM variant of the schedule: the same runs and the same output as the global-scratch kernel below, but
+// each run's per-expert count, then its exclusive prefix inside the expert's slice, is a uint16 in local
+// memory ([expert][run]), and the ids of a run are read 16 at a time ahead of the updates. The global variant
+// spends most of its ~110 us on dependent read-modify-writes of global scratch. uint16 holds every value when
+// n_routes <= 65536: a prefix is below its expert's count, which is at most n_routes.
+static constexpr int MMID_SCHED_BATCH = 16;
+
+static bool mmid_sched_slm_ok(int64_t n_as, int64_t n_routes, dpct::queue_ptr stream) {
+    static const int env = [] {
+        const char * e = getenv("GGML_SYCL_MMID_SCHED_SLM");
+        return e ? atoi(e) : 1;
+    }();
+    if (!env || n_routes > 65536) {
+        return false;
+    }
+    const size_t need = (size_t) n_as * MMID_SCHED_WG * sizeof(uint16_t) + 3 * (n_as + 1) * sizeof(uint32_t);
+    return need <= stream->get_device().get_info<sycl::info::device::local_mem_size>();
+}
+
 bool ggml_sycl_build_mmid_schedule(const int32_t * ids_dev, size_t ids_token_stride, int64_t n_as, int64_t n_ids,
                                    int64_t n_tokens, int64_t n_tiles_max, mmid_row_mapping * row_mapping,
                                    ggml_sycl_grouped_gemm_tile * tiles, uint32_t * expert_offsets,
-                                   dpct::queue_ptr stream) {
+                                   uint32_t * scratch, dpct::queue_ptr stream) {
     if (n_as <= 0 || n_as > GGML_SYCL_MMID_SCHED_MAX_EXPERTS || n_ids <= 0 || n_tokens <= 0 || n_ids > INT32_MAX / n_tokens) {
         return false;
     }
@@ -1288,8 +1393,120 @@ bool ggml_sycl_build_mmid_schedule(const int32_t * ids_dev, size_t ids_token_str
         return false;
     }
 
+    if (mmid_sched_slm_ok(n_as, n_routes, stream)) {
+        stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<uint32_t, 1> l_cnt(n_as + 1, cgh);
+            sycl::local_accessor<uint32_t, 1> l_off(n_as + 1, cgh);
+            sycl::local_accessor<uint32_t, 1> l_toff(n_as + 1, cgh);
+            sycl::local_accessor<uint16_t, 1> l_run((size_t) n_as * MMID_SCHED_WG, cgh);
+            cgh.parallel_for(sycl::nd_range<1>(MMID_SCHED_WG, MMID_SCHED_WG),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                constexpr int  WG  = MMID_SCHED_WG;
+                constexpr int  B   = MMID_SCHED_BATCH;
+                const auto     grp = item.get_group();
+                const int64_t  tid = item.get_local_id(0);
+                uint32_t *     cnt  = l_cnt.get_multi_ptr<sycl::access::decorated::no>().get();
+                uint32_t *     off  = l_off.get_multi_ptr<sycl::access::decorated::no>().get();
+                uint32_t *     toff = l_toff.get_multi_ptr<sycl::access::decorated::no>().get();
+                uint16_t *     run  = l_run.get_multi_ptr<sycl::access::decorated::no>().get();
+
+                for (int64_t i = tid; i < n_as * WG; i += WG) {
+                    run[i] = 0;
+                }
+                for (int64_t r = tid; r < n_routes; r += WG) {
+                    row_mapping[r] = { 0, 0 };
+                }
+                sycl::group_barrier(grp);
+
+                const int64_t chunk   = (n_routes + WG - 1) / WG;
+                const int64_t r_begin = std::min<int64_t>(tid * chunk, n_routes);
+                const int64_t r_end   = std::min<int64_t>(r_begin + chunk, n_routes);
+                // n_routes <= 65536, so 32-bit route math; a batch walks (token, slot) without a division a route
+                auto load_batch = [&](int64_t r0, int32_t (&e)[B], uint32_t & token0, uint32_t & slot0) {
+                    token0 = (uint32_t) r0 / (uint32_t) n_ids;
+                    slot0  = (uint32_t) r0 - token0 * (uint32_t) n_ids;
+                    uint32_t token = token0, slot = slot0;
+#pragma unroll
+                    for (int j = 0; j < B; ++j) {
+                        int32_t v = -1;
+                        if (r0 + j < r_end) {
+                            v = ((const int32_t *) ((const char *) ids_dev + (size_t) token * ids_token_stride))[slot];
+                        }
+                        e[j] = v >= 0 && v < n_as ? v : -1;
+                        if (++slot == (uint32_t) n_ids) {
+                            slot = 0;
+                            ++token;
+                        }
+                    }
+                };
+                for (int64_t r0 = r_begin; r0 < r_end; r0 += B) {
+                    int32_t  e[B];
+                    uint32_t token0, slot0;
+                    load_batch(r0, e, token0, slot0);
+#pragma unroll
+                    for (int j = 0; j < B; ++j) {
+                        if (e[j] >= 0) {
+                            run[e[j] * WG + tid]++;
+                        }
+                    }
+                }
+                sycl::group_barrier(grp);
+
+                // per expert, the runs' counts become their exclusive prefix; the total is the expert's count.
+                // A sub-group takes an expert, a lane 16 consecutive runs (WG == 16 * 16).
+                static_assert(WG == 256, "a lane scans WG / 16 runs");
+                {
+                    const auto sg   = item.get_sub_group();
+                    const int  sgid = sg.get_group_linear_id();
+                    const int  lane = sg.get_local_linear_id();
+                    for (int64_t e = sgid; e < n_as; e += WG / 16) {
+                        uint16_t * re = run + e * WG + lane * 16;
+                        uint32_t   pre[16];
+                        uint32_t   local = 0;
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) {
+                            pre[j] = local;
+                            local += re[j];
+                        }
+                        const uint32_t base = sycl::exclusive_scan_over_group(sg, local, sycl::plus<uint32_t>());
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) {
+                            re[j] = (uint16_t) (base + pre[j]);
+                        }
+                        const uint32_t tot = sycl::reduce_over_group(sg, local, sycl::plus<uint32_t>());
+                        if (lane == 0) {
+                            cnt[e] = tot;
+                        }
+                    }
+                }
+                sycl::group_barrier(grp);
+                mmid_sched_scan(grp, tid, cnt, off, n_as);
+
+                for (int64_t r0 = r_begin; r0 < r_end; r0 += B) {
+                    int32_t  e[B];
+                    uint32_t token, slot;
+                    load_batch(r0, e, token, slot);
+#pragma unroll
+                    for (int j = 0; j < B; ++j) {
+                        if (e[j] >= 0) {
+                            const uint32_t pos = off[e[j]] + run[e[j] * WG + tid]++;
+                            row_mapping[pos]   = { (int32_t) slot, (int32_t) token };
+                        }
+                        if (++slot == (uint32_t) n_ids) {
+                            slot = 0;
+                            ++token;
+                        }
+                    }
+                }
+                sycl::group_barrier(grp);
+                mmid_sched_tiles(grp, tid, cnt, off, toff, n_as, n_tiles_max, tiles, expert_offsets);
+            });
+        });
+        return true;
+    }
+
     stream->submit([&](sycl::handler & cgh) {
-        // l_cnt is reused: route counts, then the write cursors, then the tile count per expert
+        // l_cnt is reused: route counts, then the tile count per expert
         sycl::local_accessor<uint32_t, 1> l_cnt(n_as + 1, cgh);
         sycl::local_accessor<uint32_t, 1> l_off(n_as + 1, cgh);
         sycl::local_accessor<uint32_t, 1> l_toff(n_as + 1, cgh);
@@ -1302,83 +1519,195 @@ bool ggml_sycl_build_mmid_schedule(const int32_t * ids_dev, size_t ids_token_str
                 uint32_t * off  = l_off.get_multi_ptr<sycl::access::decorated::no>().get();
                 uint32_t * toff = l_toff.get_multi_ptr<sycl::access::decorated::no>().get();
 
-                for (int64_t e = tid; e < n_as; e += MMID_SCHED_WG) {
-                    cnt[e] = 0;
+                // The routes are cut into one contiguous run per work-item. A run's per-expert counts
+                // live in its own row of scratch, so each expert's rows land in route order (token,
+                // then slot), the order of the host sort, and the same every run: atomic arrival
+                // order would permute an expert's rows between runs, and the output with them.
+                const int64_t chunk   = (n_routes + MMID_SCHED_WG - 1) / MMID_SCHED_WG;
+                const int64_t r_begin = std::min<int64_t>(tid * chunk, n_routes);
+                const int64_t r_end   = std::min<int64_t>(r_begin + chunk, n_routes);
+                uint32_t *    mine    = scratch + tid * n_as;
+                for (int64_t e = 0; e < n_as; ++e) {
+                    mine[e] = 0;
                 }
                 // a dropped route must leave a row that names (0, 0) rather than stale memory
                 for (int64_t r = tid; r < n_routes; r += MMID_SCHED_WG) {
                     row_mapping[r] = { 0, 0 };
                 }
-                sycl::group_barrier(grp);
-
-                for (int64_t r = tid; r < n_routes; r += MMID_SCHED_WG) {
+                for (int64_t r = r_begin; r < r_end; ++r) {
                     const int64_t   token  = r / n_ids;
                     const int64_t   slot   = r - token * n_ids;
                     const int32_t * id_row = (const int32_t *) ((const char *) ids_dev + token * ids_token_stride);
                     const int32_t   e      = id_row[slot];
                     if (e >= 0 && e < n_as) {
-                        mmid_sched_atomic(cnt[e]).fetch_add(1u);
+                        mine[e]++;
                     }
                 }
                 sycl::group_barrier(grp);
 
-                sycl::joint_exclusive_scan(grp, cnt, cnt + n_as, off, 0u, sycl::plus<uint32_t>());
-                sycl::group_barrier(grp);
-                if (tid == 0) {
-                    off[n_as] = off[n_as - 1] + cnt[n_as - 1];
-                }
-                sycl::group_barrier(grp);
-
+                // per expert, the runs' counts become their exclusive prefix (the run's first row
+                // inside the expert's slice); the total is the expert's count
                 for (int64_t e = tid; e < n_as; e += MMID_SCHED_WG) {
-                    cnt[e] = off[e];
+                    uint32_t run = 0;
+                    for (int t = 0; t < MMID_SCHED_WG; ++t) {
+                        const uint32_t c       = scratch[t * n_as + e];
+                        scratch[t * n_as + e] = run;
+                        run += c;
+                    }
+                    cnt[e] = run;
                 }
                 sycl::group_barrier(grp);
 
-                // Atomic arrival order can differ from the host sort; each expert gets the same rows.
-                for (int64_t r = tid; r < n_routes; r += MMID_SCHED_WG) {
+                mmid_sched_scan(grp, tid, cnt, off, n_as);
+
+                for (int64_t r = r_begin; r < r_end; ++r) {
                     const int64_t   token  = r / n_ids;
                     const int64_t   slot   = r - token * n_ids;
                     const int32_t * id_row = (const int32_t *) ((const char *) ids_dev + token * ids_token_stride);
                     const int32_t   e      = id_row[slot];
                     if (e >= 0 && e < n_as) {
-                        const uint32_t pos = mmid_sched_atomic(cnt[e]).fetch_add(1u);
+                        const uint32_t pos = off[e] + mine[e]++;
                         row_mapping[pos]   = { (int32_t) slot, (int32_t) token };
                     }
                 }
                 sycl::group_barrier(grp);
 
-                for (int64_t e = tid; e < n_as; e += MMID_SCHED_WG) {
-                    cnt[e] = (off[e + 1] - off[e] + GGML_SYCL_FG_BN - 1) / GGML_SYCL_FG_BN;
-                }
-                sycl::group_barrier(grp);
-
-                sycl::joint_exclusive_scan(grp, cnt, cnt + n_as, toff, 0u, sycl::plus<uint32_t>());
-                sycl::group_barrier(grp);
-                if (tid == 0) {
-                    toff[n_as] = toff[n_as - 1] + cnt[n_as - 1];
-                }
-                sycl::group_barrier(grp);
-
-                const uint32_t n_tiles = toff[n_as];
-                for (int64_t e = tid; e < n_as; e += MMID_SCHED_WG) {
-                    const uint32_t base = off[e];
-                    const uint32_t end  = off[e + 1];
-                    for (uint32_t j = 0; j < cnt[e]; ++j) {
-                        const uint32_t n0 = base + j * GGML_SYCL_FG_BN;
-                        const uint32_t n1 = n0 + GGML_SYCL_FG_BN < end ? n0 + GGML_SYCL_FG_BN : end;
-                        tiles[toff[e] + j] = { (int32_t) e, (int32_t) n0, (int32_t) n1 };
-                    }
-                }
-                // the launch is bounded, so the unused tail must be tiles the GEMM skips
-                for (int64_t t = n_tiles + tid; t < n_tiles_max; t += MMID_SCHED_WG) {
-                    tiles[t] = { 0, 0, 0 };
-                }
-                for (int64_t e = tid; e <= n_as; e += MMID_SCHED_WG) {
-                    expert_offsets[e] = off[e];
-                }
+                mmid_sched_tiles(grp, tid, cnt, off, toff, n_as, n_tiles_max, tiles, expert_offsets);
             });
     });
     return true;
+}
+
+// The device schedule's B pack: routed src1 rows (through src1.map) -> packed [K/V][Npad][V], as
+// grouped_gemm_pack_b. A work-group is one tile (BN columns) by PACK_KQ packed k rows and goes
+// through SLM, so lanes read consecutive values of one src1 row and write each packed row in BN-wide
+// runs: a work-item per packed value read 8 bytes of a different row per lane, at half the bandwidth.
+// Tiles past the schedule's end are skipped (the GEMM skips them too); the columns of a partial
+// tile past its last row are zero.
+static constexpr int FG_PACK_KQ = 64;  // packed k rows (dwords of B) of one work-group
+
+// tanh through the hardware exp: the value is rounded to half right after, far coarser than its error
+// (a few f32 ulp, absolute ~1e-7 near 0), and sycl::tanh made the SiTU pack compute-bound.
+static inline float fg_tanh(float y) {
+    const float t = sycl::native::exp(-2.0f * sycl::fabs(y));
+    return sycl::copysign((1.0f - t) / (1.0f + t), y);
+}
+
+template <typename S, bool SITU>
+static void grouped_gemm_pack_b_device(const ggml_sycl_grouped_gemm_rows src1, const ggml_sycl_grouped_gemm_tile * tiles,
+                                       typename S::tsb * packed, const int Npad, const int K, const int64_t n_tiles,
+                                       const ggml_sycl_grouped_gemm_situ situ, dpct::queue_ptr stream) {
+    using E           = typename S::EB;
+    using tsb         = typename S::tsb;
+    constexpr int V   = S::VNNI;
+    constexpr int BN  = S::BN;
+    constexpr int WG  = 256;
+    constexpr int KPI = FG_PACK_KQ * BN / WG;  // packed values one work-item moves
+    constexpr int L      = 16;                  // load run: lanes reading one row
+    constexpr int CPR    = BN * L / WG;         // columns of one load run
+    constexpr int KQ_IT  = FG_PACK_KQ / L;      // load steps down a column
+    static_assert(FG_PACK_KQ * BN % WG == 0 && WG % BN == 0 && FG_PACK_KQ % KPI == 0, "pack tiling");
+    static_assert(BN * L % WG == 0 && FG_PACK_KQ % L == 0 && CPR * KQ_IT == KPI, "pack load tiling");
+    struct alignas(4) word {
+        tsb v[V];
+    };
+    static_assert(sizeof(word) == 4, "one packed value is a dword");
+    const int     kqs      = K / V;
+    const int64_t kgroups  = (kqs + FG_PACK_KQ - 1) / FG_PACK_KQ;
+    const float   beta     = situ.beta;
+    const float   lb       = situ.lb;
+    const float   inv_beta = 1.0f / beta;
+    const float   inv_lb   = lb > 0.0f ? 1.0f / lb : 0.0f;
+    const ptrdiff_t g_off  = situ.g_off;
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<word, 1> tile_s(FG_PACK_KQ * (BN + 1), cgh);
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tiles, kgroups * WG), sycl::range<2>(1, WG)),
+                         [=](sycl::nd_item<2> it) {
+            const int                         t    = it.get_group(0);
+            const ggml_sycl_grouped_gemm_tile tile = tiles[t];
+            if (tile.n1 <= tile.n0) {
+                return;
+            }
+            const int lid = it.get_local_id(1);
+            const int kq0 = it.get_group(1) * FG_PACK_KQ;
+            // load: a run of L work-items converts L consecutive packed values of one column, so each read
+            // instruction covers L*V consecutive floats of a src1 row; run r takes columns r*CPR.. and
+            // KQ_IT such steps down each
+            {
+                const int r    = lid / L;
+                const int lane = lid % L;
+#pragma unroll
+                for (int cc = 0; cc < CPR; ++cc) {
+                    const int c   = r * CPR + cc;
+                    const int row = tile.n0 + c;
+                    const float * in = nullptr;
+                    if (row < tile.n1) {
+                        const mmid_row_mapping mapping = src1.map[row];
+                        in = (const float *) (src1.base + (mapping.i1 % src1.ne1) * src1.nb1 + mapping.i2 * src1.nb2);
+                    }
+#pragma unroll
+                    for (int j = 0; j < KQ_IT; ++j) {
+                        const int kql = j * L + lane;
+                        const int kq  = kq0 + kql;
+                        word      w   = {};
+                        if (in && kq < kqs) {
+#pragma unroll
+                            for (int v = 0; v < V; ++v) {
+                                float val = in[V * kq + v];
+                                if constexpr (SITU) {
+                                    const float * g   = (const float *) ((const char *) in + g_off);
+                                    float         gv  = g[V * kq + v];
+                                    const float   act = fg_tanh(val * inv_beta) * beta *
+                                                      (1.0f / (1.0f + sycl::native::exp(-val)));
+                                    if (lb > 0.0f) {
+                                        gv = fg_tanh(gv * inv_lb) * lb;
+                                    }
+                                    val = act * gv;
+                                }
+                                w.v[v] = E::cvt(val);
+                            }
+                        }
+                        tile_s[kql * (BN + 1) + c] = w;
+                    }
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            // store: BN consecutive work-items write one packed row of the tile
+#pragma unroll
+            for (int j = 0; j < KPI; ++j) {
+                const int kql = j * (WG / BN) + lid / BN;
+                const int c   = lid % BN;
+                const int kq  = kq0 + kql;
+                if (kq < kqs) {
+                    *(word *) (packed + ((size_t) kq * Npad + (size_t) t * BN + c) * V) = tile_s[kql * (BN + 1) + c];
+                }
+            }
+        });
+    });
+}
+
+// src1 f32 rows (slot s, token t at base + s*nb1 + t*nb2) -> contiguous half rows [t][s][K], rounded as the
+// pack rounds them: the B the SiTU-epilogue kernel gathers from
+static void fg_src1_to_half(const ggml_sycl_grouped_gemm_rows src1, sycl::half * out, const int64_t n_tokens,
+                            const int64_t K, dpct::queue_ptr stream) {
+    const int64_t kh  = K / 2;
+    const int64_t ne1 = src1.ne1;
+    stream->parallel_for(sycl::range<1>((size_t) (n_tokens * ne1 * kh)), [=](sycl::id<1> id) {
+        const int64_t i   = id[0];
+        const int64_t row = i / kh;
+        const int64_t k2  = i - row * kh;
+        const float * in  = (const float *) (src1.base + (row % ne1) * src1.nb1 + (row / ne1) * src1.nb2) + 2 * k2;
+        const sycl::float2 v = *(const sycl::float2 *) in;
+        *(sycl::half2 *) (out + 2 * i) = sycl::half2((sycl::half) v.x(), (sycl::half) v.y());
+    });
+}
+
+static bool fg_moe_gb_env() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_SYCL_MOE_GB");
+        return e ? atoi(e) != 0 : true;
+    }();
+    return v;
 }
 
 template <typename S>
@@ -1386,7 +1715,9 @@ static bool fg_grouped_device_run(ggml_type src0_type, bool reordered, const voi
                                    ggml_sycl_grouped_gemm_rows src1, ggml_sycl_grouped_gemm_rows dst,
                                    const int32_t * ids_dev, size_t ids_token_stride, int64_t n_as, int64_t n_ids,
                                    int64_t n_tokens, int64_t M, int64_t K, ggml_sycl_pool & pool,
-                                   dpct::queue_ptr stream) {
+                                   dpct::queue_ptr stream, const ggml_sycl_grouped_gemm_situ * situ,
+                                   ggml_sycl_mmid_sched * shared, const ggml_sycl_grouped_gemm_situ_out * epi,
+                                   int combo) {
     if constexpr (S::BN != GGML_SYCL_FG_BN) {
         return false;
     } else {
@@ -1396,81 +1727,159 @@ static bool fg_grouped_device_run(ggml_type src0_type, bool reordered, const voi
             return false;
         }
         const int Npad = (int) (max_tiles * S::BN);
-        ggml_sycl_pool_alloc<mmid_row_mapping> rows(pool, total_rows);
-        ggml_sycl_pool_alloc<ggml_sycl_grouped_gemm_tile> tiles(pool, max_tiles);
-        ggml_sycl_pool_alloc<uint32_t> offsets(pool, n_as + 1);
-        if (!ggml_sycl_build_mmid_schedule(ids_dev, ids_token_stride, n_as, n_ids, n_tokens, max_tiles,
-                                           rows.get(), tiles.get(), offsets.get(), stream)) {
+        ggml_sycl_mmid_sched   local;
+        ggml_sycl_mmid_sched * sc = &local;
+        if (shared && (shared->max_tiles == 0 ||
+                       (shared->ids == ids_dev && shared->ids_stride == ids_token_stride && shared->n_as == n_as &&
+                        shared->n_ids == n_ids && shared->n_tokens == n_tokens && shared->max_tiles == max_tiles))) {
+            sc = shared;
+        }
+        // the combine's half rows (dst.w) only from the down projection whose B the gate_up epilogue packed,
+        // so nothing is queued before the ESIMD kernel takes or declines the call
+        const bool from_epi = situ && sc == shared && sc->max_tiles != 0 && sc->next_K == K && sc->next_combo == combo;
+        if (dst.w && !from_epi) {
             return false;
         }
-        src1.map = rows.get();
-        dst.map = rows.get();
-        ggml_sycl_pool_alloc<typename S::tsb> packed_b(pool, (size_t) K * Npad);
-        const ggml_sycl_grouped_gemm_tile * tile_ptr = tiles.get();
-        typename S::tsb * packed = packed_b.get();
-        using E = typename S::EB;
-        constexpr int V = S::VNNI;
-        stream->parallel_for(sycl::range<1>((size_t) Npad * (K / V)), [=](sycl::id<1> id) {
-            const size_t idx = id[0];
-            const int kq = idx / Npad;
-            const int n = idx - (size_t) kq * Npad;
-            const ggml_sycl_grouped_gemm_tile tile = tile_ptr[n / S::BN];
-            const int row = tile.n0 + n % S::BN;
-            typename S::tsb vals[V] = {};
-            if (row < tile.n1) {
-                const mmid_row_mapping mapping = src1.map[row];
-                const float * in = (const float *) (src1.base + (mapping.i1 % src1.ne1) * src1.nb1 + mapping.i2 * src1.nb2) + V * kq;
-#pragma unroll
-                for (int v = 0; v < V; ++v) {
-                    vals[v] = E::cvt(in[v]);
+        if (sc->max_tiles == 0) {
+            sc->rows.alloc(pool, total_rows);
+            sc->tiles.alloc(pool, max_tiles);
+            sc->offsets.alloc(pool, n_as + 1);
+            sc->scratch.alloc(pool, ggml_sycl_mmid_schedule_scratch(n_as));
+            if (!ggml_sycl_build_mmid_schedule(ids_dev, ids_token_stride, n_as, n_ids, n_tokens, max_tiles,
+                                               sc->rows.get(), sc->tiles.get(), sc->offsets.get(),
+                                               sc->scratch.get(), stream)) {
+                return false;
+            }
+            sc->ids        = ids_dev;
+            sc->ids_stride = ids_token_stride;
+            sc->n_as       = n_as;
+            sc->n_ids      = n_ids;
+            sc->n_tokens   = n_tokens;
+            sc->max_tiles  = max_tiles;
+        }
+        src1.map = sc->rows.get();
+        dst.map = sc->rows.get();
+        const ggml_sycl_grouped_gemm_tile * tile_ptr = sc->tiles.get();
+        const bool try_epi = epi && sc == shared && sc->next_K == 0 && epi->D > 0;
+        if (try_epi && sc->next_b.get() == nullptr) {
+            // before packed_b: the pool frees in reverse allocation order, and this one outlives the call
+            sc->next_b.alloc(pool, (size_t) epi->D * Npad * sizeof(typename S::tsb));
+        }
+        // the epilogue kernel gathers B from half rows of src1 instead of a packed B (GGML_SYCL_MOE_GB=0: packs)
+        ggml_sycl_pool_alloc<typename S::tsb> b16_alloc;
+        const typename S::tsb *               b16 = nullptr;
+        if constexpr (std::is_same_v<typename S::tsb, sycl::half>) {
+            if (try_epi && !situ && fg_moe_gb_env() && K % 2 == 0 && src1.nb1 % 8 == 0 && src1.nb2 % 8 == 0 &&
+                (uintptr_t) src1.base % 8 == 0 && n_tokens * src1.ne1 * K * 2 <= (int64_t) UINT32_MAX) {
+                // the f16 copy of the rows when a producer wrote one (same rounding), else converted here
+                if (src1.h) {
+                    b16 = src1.h;
+                } else {
+                    sycl::half * h = b16_alloc.alloc(pool, (size_t) (n_tokens * src1.ne1 * K));
+                    fg_src1_to_half(src1, h, n_tokens, K, stream);
+                    b16 = h;
                 }
             }
-            typename S::tsb * out = packed + ((size_t) kq * Npad + n) * V;
-#pragma unroll
-            for (int v = 0; v < V; ++v) {
-                out[v] = vals[v];
+        }
+        ggml_sycl_pool_alloc<typename S::tsb> packed_b;
+        typename S::tsb * packed = nullptr;
+        auto pack = [&]() {
+            packed = packed_b.alloc(pool, (size_t) K * Npad);
+            if (situ) {
+                grouped_gemm_pack_b_device<S, true>(src1, tile_ptr, packed, Npad, (int) K, max_tiles, *situ, stream);
+            } else {
+                grouped_gemm_pack_b_device<S, false>(src1, tile_ptr, packed, Npad, (int) K, max_tiles, {}, stream);
             }
-        });
+        };
+        if (situ && sc == shared && sc->next_K == K && sc->next_combo == combo) {
+            // the previous projection's epilogue packed this B
+            packed       = (typename S::tsb *) sc->next_b.get();
+            sc->next_K   = 0;
+        } else if (!b16) {
+            pack();
+        }
         const int64_t groups_m = (M + S::SG_ROWS - 1) / S::SG_ROWS;
-        return fg_visit_type(src0_type, reordered, [&](auto tag) {
+        if (try_epi) {
+            // the SiTU epilogue writes the next projection's packed B in place of dst, when the kernel has it
+            ggml_sycl_grouped_gemm_situ_out e = *epi;
+            e.out                             = sc->next_b.get();
+            e.b16                             = b16;
+            e.b_ne1                           = (int) src1.ne1;
+            bool done                         = false;
+            fg_visit_type(src0_type, reordered, [&](auto tag) {
+                using T = decltype(tag);
+                done = grouped_dequant_gemm_launch<S, typename T::type, T::reordered>((const char *) src0_base,
+                    expert_stride, tile_ptr, packed, (float *) dst.base, (int) M, Npad, (int) K, max_tiles, groups_m,
+                    stream, dst, sc->offsets.get(), &e);
+            });
+            if (done) {
+                sc->next_K     = epi->D;
+                sc->next_combo = combo;
+                return true;
+            }
+        }
+        if (!packed) {
+            pack();
+        }
+        bool launched = true;
+        const bool visited = fg_visit_type(src0_type, reordered, [&](auto tag) {
             using T = decltype(tag);
-            grouped_dequant_gemm_launch<S, typename T::type, T::reordered>((const char *) src0_base, expert_stride,
-                tile_ptr, packed, (float *) dst.base, (int) M, Npad, (int) K, max_tiles, groups_m, stream, dst);
+            launched = grouped_dequant_gemm_launch<S, typename T::type, T::reordered>((const char *) src0_base,
+                expert_stride, tile_ptr, packed, (float *) dst.base, (int) M, Npad, (int) K, max_tiles, groups_m,
+                stream, dst, sc->offsets.get());
         });
+        if (dst.w && !(visited && launched)) {
+            // declined with nothing queued: the epilogue's B stays for the plain call
+            sc->next_K = K;
+            return false;
+        }
+        return visited;
     }
+}
+
+int ggml_sycl_grouped_dequant_gemm_device_combo(ggml_type src0_type, bool reordered, int32_t src1_prec,
+                                                int64_t n_as, int64_t n_ids, int64_t n_tokens,
+                                                int64_t M, int64_t K, dpct::queue_ptr stream) {
+    if (n_as <= 0 || n_as > GGML_SYCL_MMID_SCHED_MAX_EXPERTS || n_ids <= 0 || n_tokens <= 0 ||
+        n_ids > INT32_MAX / n_tokens) {
+        return -1;
+    }
+    const int64_t total_rows = n_ids * n_tokens;
+    // The active expert count is unknown until the GPU builds the schedule. The bound keeps wide
+    // experts on the per-expert library GEMMs, which beat the joint_matrix kernel there; the ESIMD
+    // kernel beats them at any width (B70, Inkling ub2048: q4_K 2304x2304 2.7 ms a call against the
+    // host-synchronised loop's several), so a format it covers takes every batch.
+    const bool unbounded = (g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_UNBOUNDED) != 0 ||
+                           fg_esimd_covers(src0_type, reordered);
+    if (g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F32 ||
+        !ggml_sycl_xmx_gather_type_enabled(src0_type) || !fg_visit_type(src0_type, reordered, [](auto) {}) ||
+        !ggml_sycl_grouped_dequant_gemm_shape_ok(src0_type, M, K, total_rows, std::min(n_as, total_rows),
+                                                unbounded)) {
+        return -1;
+    }
+    const sycl::device device = stream->get_device();
+    if (device.get_info<sycl::info::device::max_work_group_size>() < MMID_SCHED_WG ||
+        device.get_info<sycl::info::device::local_mem_size>() < 3 * (n_as + 1) * sizeof(uint32_t)) {
+        return -1;
+    }
+    if (grouped_gemm_max_tiles(total_rows, n_as, GGML_SYCL_FG_BN) > INT32_MAX / GGML_SYCL_FG_BN) {
+        return -1;
+    }
+    const int combo = fg_esimd_remap(stream, fg_pick_combo(stream, GGML_TYPE_F32, src1_prec), src0_type, reordered);
+    if (combo < 0) {
+        return -1;
+    }
+    // the device schedule is built for GGML_SYCL_FG_BN-wide tiles, see fg_grouped_device_run()
+    bool bn_ok = false;
+    fg_visit_combo(combo, [&](auto s) { bn_ok = decltype(s)::BN == GGML_SYCL_FG_BN; });
+    return bn_ok ? combo : -1;
 }
 
 bool ggml_sycl_grouped_dequant_gemm_device_supported(ggml_type src0_type, bool reordered, int32_t src1_prec,
                                                       int64_t n_as, int64_t n_ids, int64_t n_tokens,
                                                       int64_t M, int64_t K, dpct::queue_ptr stream) {
-    if (n_as <= 0 || n_as > GGML_SYCL_MMID_SCHED_MAX_EXPERTS || n_ids <= 0 || n_tokens <= 0 ||
-        n_ids > INT32_MAX / n_tokens) {
-        return false;
-    }
-    const int64_t total_rows = n_ids * n_tokens;
-    // The active expert count is unknown until the GPU builds the schedule.
-    if (g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F32 ||
-        !ggml_sycl_xmx_gather_type_enabled(src0_type) || !fg_visit_type(src0_type, reordered, [](auto) {}) ||
-        !ggml_sycl_grouped_dequant_gemm_shape_ok(src0_type, M, K, total_rows, std::min(n_as, total_rows),
-                                                (g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_UNBOUNDED) != 0)) {
-        return false;
-    }
-    const sycl::device device = stream->get_device();
-    if (device.get_info<sycl::info::device::max_work_group_size>() < MMID_SCHED_WG ||
-        device.get_info<sycl::info::device::local_mem_size>() < 3 * (n_as + 1) * sizeof(uint32_t)) {
-        return false;
-    }
-    if (grouped_gemm_max_tiles(total_rows, n_as, GGML_SYCL_FG_BN) > INT32_MAX / GGML_SYCL_FG_BN) {
-        return false;
-    }
-    const int combo = fg_esimd_remap(stream, fg_pick_combo(stream, GGML_TYPE_F32, src1_prec), src0_type, reordered);
-    if (combo < 0) {
-        return false;
-    }
-    // the device schedule is built for GGML_SYCL_FG_BN-wide tiles, see fg_grouped_device_run()
-    bool bn_ok = false;
-    fg_visit_combo(combo, [&](auto s) { bn_ok = decltype(s)::BN == GGML_SYCL_FG_BN; });
-    return bn_ok;
+    return ggml_sycl_grouped_dequant_gemm_device_combo(src0_type, reordered, src1_prec, n_as, n_ids, n_tokens, M, K,
+                                                       stream) >= 0;
 }
 
 bool ggml_sycl_grouped_dequant_gemm_device(ggml_type src0_type, bool reordered, const void * src0_base,
@@ -1478,17 +1887,22 @@ bool ggml_sycl_grouped_dequant_gemm_device(ggml_type src0_type, bool reordered, 
                                            int32_t src1_prec, const ggml_sycl_grouped_gemm_rows & dst,
                                            const int32_t * ids_dev, size_t ids_token_stride, int64_t n_as,
                                            int64_t n_ids, int64_t n_tokens, int64_t M, int64_t K, ggml_sycl_pool & pool,
-                                           dpct::queue_ptr stream) {
-    if (src1.ne1 <= 0 || dst.ne1 <= 0 ||
-        !ggml_sycl_grouped_dequant_gemm_device_supported(src0_type, reordered, src1_prec, n_as, n_ids,
-                                                        n_tokens, M, K, stream)) {
+                                           dpct::queue_ptr stream, const ggml_sycl_grouped_gemm_situ * situ,
+                                           ggml_sycl_mmid_sched * sched, const ggml_sycl_grouped_gemm_situ_out * epi,
+                                           int epi_combo) {
+    const int combo = ggml_sycl_grouped_dequant_gemm_device_combo(src0_type, reordered, src1_prec, n_as, n_ids,
+                                                                  n_tokens, M, K, stream);
+    if (src1.ne1 <= 0 || dst.ne1 <= 0 || combo < 0) {
         return false;
     }
-    const int combo = fg_esimd_remap(stream, fg_pick_combo(stream, GGML_TYPE_F32, src1_prec), src0_type, reordered);
+    // the epilogue packs for the next projection's combination, which must be this one's
+    if (epi_combo != combo) {
+        epi = nullptr;
+    }
     bool launched = false;
     fg_visit_combo(combo, [&](auto s) {
         launched = fg_grouped_device_run<decltype(s)>(src0_type, reordered, src0_base, expert_stride, src1, dst,
-            ids_dev, ids_token_stride, n_as, n_ids, n_tokens, M, K, pool, stream);
+            ids_dev, ids_token_stride, n_as, n_ids, n_tokens, M, K, pool, stream, situ, sched, epi, combo);
     });
     return launched;
 }

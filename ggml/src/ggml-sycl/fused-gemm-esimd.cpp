@@ -3,6 +3,9 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+
+namespace syclex = sycl::ext::oneapi::experimental;
 
 // One thread owns MR rows of one expert's weight and one BN-wide tile of the schedule, over the
 // whole K. Per k step (32 values) it loads the rows' stored bits, dequantizes them in registers to
@@ -88,11 +91,17 @@ template <int MR, bool L2D> struct slice {
     int             m0;
     bool            aos;
     int             bs;
+    // >= 0: the rows [MR/2, MR) of the slice are the rows from m1 on instead of m0 + MR/2 on (the x and g
+    // rows of the wide gate_up thread in one slice)
+    int             m1 = -1;
 
     // per row, the byte offset from x of byte `inner` of field f of block ib
     ESIMD_INLINE simd<uint32_t, MR> at(const field & f, const int ib, const int inner) const {
         const int             stride = aos ? bs : f.size;
         simd<uint32_t, MR> o(0, (uint32_t) (bpr * stride));
+        if (m1 >= 0) {
+            o.template select<MR / 2, 1>(MR / 2) += (uint32_t) ((m1 - m0 - MR / 2) * bpr * stride);
+        }
         return o + (uint32_t) ((aos ? f.aos : nblocks * f.pre) + (m0 * bpr + ib) * stride + inner);
     }
 
@@ -122,8 +131,18 @@ template <int MR, bool L2D> struct slice {
         if constexpr (L2D) {
             if (!aos) {
                 const unsigned pitch = (unsigned) (bpr * f.size);
-                return load_2d<uint32_t, W, MR>((const uint32_t *) (x + (size_t) nblocks * f.pre), pitch - 1, M - 1,
-                                                pitch - 1, (ib * f.size + inner) / 4, m0);
+                const uint32_t * base = (const uint32_t *) (x + (size_t) nblocks * f.pre);
+                if constexpr (MR % 2 == 0) {
+                    if (m1 >= 0) {
+                        simd<uint32_t, MR * W> t;
+                        t.template select<MR / 2 * W, 1>(0) =
+                            load_2d<uint32_t, W, MR / 2>(base, pitch - 1, M - 1, pitch - 1, (ib * f.size + inner) / 4, m0);
+                        t.template select<MR / 2 * W, 1>(MR / 2 * W) =
+                            load_2d<uint32_t, W, MR / 2>(base, pitch - 1, M - 1, pitch - 1, (ib * f.size + inner) / 4, m1);
+                        return t;
+                    }
+                }
+                return load_2d<uint32_t, W, MR>(base, pitch - 1, M - 1, pitch - 1, (ib * f.size + inner) / 4, m0);
             }
         }
         const simd<uint32_t, MR> o = at(f, ib, inner);
@@ -297,11 +316,18 @@ template <typename block_q_t, int MR = GROUPED_GEMM_MR> struct grouped_gemm_esim
     static constexpr bool supported = false;
 };
 
+// a format with decode_fast<g>(), which the default mode (KS == 1) takes: fewer instructions than decode()
+// and a rounding the bit-identical mode does not reproduce
+template <typename F, typename = void> struct grouped_gemm_has_fast : std::false_type {};
+template <typename F>
+struct grouped_gemm_has_fast<F, std::void_t<decltype(F::template decode_fast<0>(std::declval<typename F::raw &>()))>>
+    : std::true_type {};
+
 // [qs 32][d], one block a k step
 template <int MR> struct grouped_gemm_esimd_a<block_q8_0, MR> {
     static constexpr bool supported = true;
     static constexpr int  qk        = QK8_0;
-    static constexpr bool whole     = true;  // decode_all() for the whole tile
+    static constexpr bool whole     = false;
     static constexpr int  slm_bytes = 0;
     static ESIMD_INLINE void init_slm() {}
     struct raw {
@@ -317,15 +343,145 @@ template <int MR> struct grouped_gemm_esimd_a<block_q8_0, MR> {
         r.q = s.template rows<8>(QS, kb, 0);
         r.d = s.u16(D, kb, 0);
     }
-    // all MR x 32 quants at once: int8 -> half, times the row's scale. q * d needs at most 19
+    // int8 -> half, times the row's scale. q * d needs at most 19
     // significant bits, so the f32 product the joint_matrix stage rounds to half is exact and one
     // correctly rounded half multiply gives the same bits.
-    static ESIMD_INLINE grouped_gemm_esimd::simd<sycl::half, MR * GROUPED_GEMM_QK> decode_all(raw & r) {
+    // The int8 to half conversion is a bit pattern: q + 128 (the byte with bit 7 flipped) in the
+    // mantissa of half 1024 (0x6400) is exactly 1152 + q, minus 1152 exactly q. The byte to half
+    // conversion moves took 3 instructions per 32 values (to words with a stride, to half with a
+    // stride, packed again), 121 of the 178 of a k step of the paired kernel. A row group at a time,
+    // in the [k half][row][16 k] order of the dpas operands, so no reorder either.
+    template <int g> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode(raw & r) {
         using namespace grouped_gemm_esimd;
-        simd<sycl::half, MR * GROUPED_GEMM_QK> av = r.q.template bit_cast_view<int8_t>();
-        simd<sycl::half, MR>         dh = r.d.template bit_cast_view<sycl::half>();
-        av *= dh.template replicate_vs_w_hs<MR, 1, GROUPED_GEMM_QK, 0>(0);
-        return av;
+        constexpr int             RC = GROUPED_GEMM_RC;
+        simd<uint32_t, RC * 8>    q  = r.q.template select<RC * 8, 1>(g * RC * 8);
+        auto                      w  = q.template bit_cast_view<uint16_t, RC, 16>();  // [row][16 words]
+        simd<uint16_t, RC>        dr = r.d.template select<RC, 1>(g * RC);
+        simd<sycl::half, RC>      dg = dr.template bit_cast_view<sycl::half>();
+        simd<sycl::half, RC * 16> ds = dg.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        a_halves                  v;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            simd<uint16_t, RC * 8>  wh = w.template select<RC, 1, 8, 1>(0, 8 * h);
+            simd<uint16_t, RC * 16> c;
+            c.template select<RC * 8, 2>(0) = (wh & (uint16_t) 0xFF) ^ (uint16_t) 0x6480;
+            c.template select<RC * 8, 2>(1) = (wh >> 8) ^ (uint16_t) 0x6480;
+            simd<sycl::half, RC * 16> hv = c.template bit_cast_view<sycl::half>();
+            v.template select<RC * 16, 1>(h * RC * 16) = (hv - (sycl::half) 1152.0f) * ds;
+        }
+        return v;
+    }
+};
+
+// [d][qh 4][qs 16], one 22-byte block a k step, canonical layout only (q5_0 has no reorder). Byte j
+// of qs holds k = j in its low and k = 16 + j in its high nibble, bit k of qh is bit 4 of value k;
+// the code minus 16 times d. Like iq4_nl the two nibbles are the two k halves of the dpas operands.
+template <int MR> struct grouped_gemm_esimd_a<block_q5_0, MR> {
+    static constexpr bool supported = true;
+    static constexpr int  qk        = QK5_0;
+    static constexpr bool whole     = false;
+    static constexpr int  slm_bytes = 0;
+    static ESIMD_INLINE void init_slm() {}
+    struct raw {
+        grouped_gemm_esimd::simd<uint32_t, MR * 4> q;
+        grouped_gemm_esimd::simd<uint32_t, MR>     qh;
+        grouped_gemm_esimd::simd<uint16_t, MR>     d;
+    };
+
+    // the SoA offsets (pre) are unused: q5_0 is only read in the canonical layout
+    static constexpr grouped_gemm_esimd::field D = { 0, 2, 0 }, QH = { 0, 4, 2 }, QS = { 0, QK5_0 / 2, 6 };
+    static bool ok(const int K, const bool aos) { return K % qk == 0 && aos; }
+    struct sb_t {};
+    template <typename Sl> static ESIMD_INLINE void load_sb(sb_t &, const Sl &, const int) {}
+    // The whole block in two 3-dword gathers per row from its start rounded down to a dword: the 24
+    // bytes hold its 22 (a block starts on 0 or 2 mod 4, and the dword of its last byte is read whole),
+    // which the field reads took five messages for. sh is 16 where the block starts on 2 mod 4, where
+    // qh and qs are dword aligned; elsewhere their dwords straddle two window dwords.
+    template <typename Sl> static ESIMD_INLINE void load(raw & r, sb_t &, const Sl & s, const int kb, const int) {
+        using namespace grouped_gemm_esimd;
+        const simd<uint32_t, MR> o  = s.at(D, kb, 0);
+        const simd<uint32_t, MR> oa = o & ~3u;
+        const simd<uint32_t, MR> sh = (o & 2u) << 3;
+        const simd<uint32_t, MR> u  = 16u - sh;
+        const simd<uint32_t, MR> um = (sh >> 4) - 1u;  // all ones where sh is 0
+        simd<uint32_t, MR * 3> w0 = gather<uint32_t, MR * 3, 3>((const uint32_t *) s.x, oa);
+        simd<uint32_t, MR * 3> w1 = gather<uint32_t, MR * 3, 3>((const uint32_t *) s.x, oa + 12u);
+        auto L = [&](const int v) SYCL_ESIMD_FUNCTION -> simd<uint32_t, MR> {
+            return v < 3 ? simd<uint32_t, MR>(w0.template select<MR, 1>(v * MR)) :
+                           simd<uint32_t, MR>(w1.template select<MR, 1>((v - 3) * MR));
+        };
+        const simd<uint32_t, MR> l0 = L(0);
+        const simd<uint32_t, MR> l1 = L(1);
+        r.d                         = (l0 >> sh) & 0xffffu;
+        r.qh                        = (l1 << u) | ((l0 >> 16) & um);
+        // qs dword v of every row, written straight to [row][4] with a dword stride of 4: the
+        // transpose as 16 two-lane moves a row took 32 instructions a k step at 16 rows
+        auto put = [&](auto vc) SYCL_ESIMD_FUNCTION {
+            constexpr int v = decltype(vc)::value;
+            r.q.template select<MR, 4>(v) = (L(v + 2) << u) | ((L(v + 1) >> 16) & um);
+        };
+        static_for<0, 4>::run(put);
+    }
+    // decode() without int to half conversions: the 5-bit code goes into the mantissa of half 1024
+    // (0x6400) by an or, which is exactly 1024 + code, and minus 1040 exactly code - 16; then the same
+    // correctly rounded half multiply by d, so the same bits as decode(). Codes are built in 16-bit
+    // lanes from the qs words (word i: bytes 2i, 2i + 1; k = 2i, 2i + 1 in their low nibbles, 16 + 2i,
+    // 17 + 2i in their high ones), the qh bit of lane k moved to bit 4 by rotating its 16-bit half
+    // left by 4, then right by k.
+    template <int g> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode_fast(raw & r) {
+        using namespace grouped_gemm_esimd;
+        constexpr int             RC = GROUPED_GEMM_RC;
+        simd<uint32_t, RC * 4>    qw = r.q.template select<RC * 4, 1>(g * RC * 4);
+        simd<uint16_t, RC * 8>    w  = qw.template bit_cast_view<uint16_t>();  // [row][8 words]
+        simd<uint32_t, RC>        hr = r.qh.template select<RC, 1>(g * RC);
+        simd<uint16_t, RC * 2>    hw = hr.template bit_cast_view<uint16_t>();  // [row][low half, high half]
+        simd<uint16_t, RC * 2>    hq = rol<uint16_t>(hw, (uint16_t) 4);
+        simd<uint16_t, RC * 16>   j(0, 1);
+        j &= 15;
+        simd<uint16_t, RC * 16> h0 = ror<uint16_t>(simd<uint16_t, RC * 16>(hq.template replicate_vs_w_hs<RC, 2, 16, 0>(0)), j);
+        simd<uint16_t, RC * 16> h1 = ror<uint16_t>(simd<uint16_t, RC * 16>(hq.template replicate_vs_w_hs<RC, 2, 16, 0>(1)), j);
+        simd<uint16_t, RC * 16> c0, c1;
+        c0.template select<RC * 8, 2>(0) = (w & (uint16_t) 0xF) | (uint16_t) 0x6400;
+        c0.template select<RC * 8, 2>(1) = ((w >> 8) & (uint16_t) 0xF) | (uint16_t) 0x6400;
+        c1.template select<RC * 8, 2>(0) = ((w >> 4) & (uint16_t) 0xF) | (uint16_t) 0x6400;
+        c1.template select<RC * 8, 2>(1) = (w >> 12) | (uint16_t) 0x6400;
+        c0 |= h0 & (uint16_t) 0x10;
+        c1 |= h1 & (uint16_t) 0x10;
+        simd<uint16_t, RC>        dr = r.d.template select<RC, 1>(g * RC);
+        simd<sycl::half, RC>      dg = dr.template bit_cast_view<sycl::half>();
+        simd<sycl::half, RC * 16> ds = dg.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        simd<sycl::half, RC * 16> v0 = c0.template bit_cast_view<sycl::half>();
+        simd<sycl::half, RC * 16> v1 = c1.template bit_cast_view<sycl::half>();
+        a_halves                  v;
+        v.template select<RC * 16, 1>(0)       = (v0 - (sycl::half) 1040.0f) * ds;
+        v.template select<RC * 16, 1>(RC * 16) = (v1 - (sycl::half) 1040.0f) * ds;
+        return v;
+    }
+    // the code is an integer in [-16, 15] and d a half, so the product needs at most 16 significant bits:
+    // the f32 product the joint_matrix stage rounds to half is exact, and one correctly rounded half
+    // multiply gives the same bits (as q8_0). The codes are built in 16-bit lanes, qh split in its halves.
+    template <int g> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode(raw & r) {
+        using namespace grouped_gemm_esimd;
+        constexpr int           RC = GROUPED_GEMM_RC;
+        simd<uint32_t, RC * 4>  qw = r.q.template select<RC * 4, 1>(g * RC * 4);
+        simd<uint16_t, RC * 16> b  = qw.template bit_cast_view<uint8_t>();
+        simd<uint32_t, RC>      hr = r.qh.template select<RC, 1>(g * RC);
+        auto                    hw = hr.template bit_cast_view<uint16_t>();  // [row][low half, high half]
+        simd<uint16_t, RC * 16> hl = hw.template replicate_vs_w_hs<RC, 2, 16, 0>(0);
+        simd<uint16_t, RC * 16> hh = hw.template replicate_vs_w_hs<RC, 2, 16, 0>(1);
+        simd<uint16_t, RC * 16> j(0, 1);
+        j &= 15;
+        simd<uint16_t, RC>      dr = r.d.template select<RC, 1>(g * RC);
+        simd<sycl::half, RC>    dg = dr.template bit_cast_view<sycl::half>();
+        simd<sycl::half, RC * 16> ds = dg.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        simd<int16_t, RC * 16>  c0 = simd<int16_t, RC * 16>((b & 0xf) | (((hl >> j) & 1) << 4)) - 16;
+        simd<int16_t, RC * 16>  c1 = simd<int16_t, RC * 16>((b >> 4) | (((hh >> j) & 1) << 4)) - 16;
+        simd<sycl::half, RC * 16> v0 = c0;
+        simd<sycl::half, RC * 16> v1 = c1;
+        a_halves                v;
+        v.template select<RC * 16, 1>(0)       = v0 * ds;
+        v.template select<RC * 16, 1>(RC * 16) = v1 * ds;
+        return v;
     }
 };
 
@@ -500,9 +656,12 @@ template <int MR> struct grouped_gemm_esimd_a<block_q4_K, MR> {
     static constexpr bool whole     = false;
     static constexpr int  slm_bytes = 0;
     static ESIMD_INLINE void init_slm() {}
+    // q: the k step's code bytes, each still shifted left by sh bits (q4_K: the high nibbles of odd k
+    // steps are left in place, the decode shifts them out)
     struct raw {
         grouped_gemm_esimd::simd<uint32_t, MR * 8> q;
         grouped_gemm_esimd::simd<float, MR>        d, m;
+        uint32_t                                   sh;
     };
     struct sb_t {
         grouped_gemm_esimd::simd<uint32_t, MR> sc[3];  // the 12 scale bytes
@@ -551,15 +710,79 @@ template <int MR> struct grouped_gemm_esimd_a<block_q4_K, MR> {
     }
     template <typename Sl> static ESIMD_INLINE void load(raw & r, sb_t & sb, const Sl & s, const int kb, const int j) {
         using namespace grouped_gemm_esimd;
-        r.q = (s.template rows<8>(QS, kb / 8, 32 * (j / 2)) >> (4 * (j & 1))) & 0x0F0F0F0Fu;
+        r.q  = s.template rows<8>(QS, kb / 8, 32 * (j / 2));
+        r.sh = 4 * (j & 1);
         scale_min(sb, j, r.d, r.m);
     }
 
-    template <int g> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode(raw & r) {
+    // The default mode's decode, codes of MASK bits: each 16-bit lane takes two codes, which go to
+    // the bits of half 1024 + code (exact) by an or, so there is no int to half conversion; then
+    // (h - 1024) * d - m in half, with d and m rounded to half first. Two roundings more than the f32
+    // expression of decode(), which the bit-identical mode keeps.
+    template <int g, uint32_t MASK> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode_fast_m(raw & r) {
+        using namespace grouped_gemm_esimd;
+        constexpr int RC = GROUPED_GEMM_RC;
+        simd<uint32_t, RC * 8>    q  = r.q.template select<RC * 8, 1>(g * RC * 8);
+        auto                      w  = q.template bit_cast_view<uint16_t, RC, 16>();
+        simd<sycl::half, RC>      dh = r.d.template select<RC, 1>(g * RC);
+        simd<sycl::half, RC>      mh = r.m.template select<RC, 1>(g * RC);
+        simd<sycl::half, RC * 16> dr = dh.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        simd<sycl::half, RC * 16> mr = mh.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        const uint16_t            s0 = (uint16_t) r.sh, s1 = (uint16_t) (r.sh + 8);
+        a_halves                  v;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            simd<uint16_t, RC * 8>  wh = w.template select<RC, 1, 8, 1>(0, 8 * h);
+            simd<uint16_t, RC * 16> c;
+            c.template select<RC * 8, 2>(0) = ((wh >> s0) & (uint16_t) MASK) | (uint16_t) 0x6400;
+            c.template select<RC * 8, 2>(1) = ((wh >> s1) & (uint16_t) MASK) | (uint16_t) 0x6400;
+            simd<sycl::half, RC * 16> hv = c.template bit_cast_view<sycl::half>();
+            hv -= (sycl::half) 1024.0f;
+            v.template select<RC * 16, 1>(h * RC * 16) = hv * dr - mr;
+        }
+        return v;
+    }
+    // The no-shift decode (GGML_SYCL_Q4K_NOSHIFT): a code byte to its 16-bit lane in one move, the k
+    // step's nibble masked in place and or'ed into 0x6400, which is half 1024 + q for a low nibble and
+    // 1024 + 16 q for a high one, so h * f + o with (f, o) = (1, -1024) or (1/16, -64) is q exactly, in
+    // one mad and with no shift; the min is negated before its replication. A's halves are the same
+    // bits as decode_fast_m's.
+    template <int g> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode_fast_ns(raw & r) {
+        using namespace grouped_gemm_esimd;
+        constexpr int             RC = GROUPED_GEMM_RC;
+        simd<uint32_t, RC * 8>    q  = r.q.template select<RC * 8, 1>(g * RC * 8);
+        auto                      qb = q.template bit_cast_view<uint8_t, RC, 32>();
+        simd<float, RC>           mf = -r.m.template select<RC, 1>(g * RC);
+        simd<sycl::half, RC>      dh = r.d.template select<RC, 1>(g * RC);
+        simd<sycl::half, RC>      mh = mf;
+        simd<sycl::half, RC * 16> dr = dh.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        simd<sycl::half, RC * 16> mr = mh.template replicate_vs_w_hs<RC, 1, 16, 0>(0);
+        const bool                hi = r.sh != 0;
+        const uint16_t            mk = hi ? (uint16_t) 0xF0 : (uint16_t) 0x0F;
+        const sycl::half          f  = hi ? (sycl::half) 0.0625f : (sycl::half) 1.0f;
+        const sycl::half          o  = hi ? (sycl::half) -64.0f : (sycl::half) -1024.0f;
+        a_halves                  v;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            simd<uint16_t, RC * 16>   u  = qb.template select<RC, 1, 16, 1>(0, 16 * h);
+            simd<uint16_t, RC * 16>   c  = (u & mk) | (uint16_t) 0x6400;
+            simd<sycl::half, RC * 16> hv = c.template bit_cast_view<sycl::half>();
+            hv = hv * f + o;
+            v.template select<RC * 16, 1>(h * RC * 16) = hv * dr + mr;
+        }
+        return v;
+    }
+    template <int g> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode_fast(raw & r) {
+        return decode_fast_m<g, 0xF>(r);
+    }
+
+    template <int g, uint32_t MASK = 0xF> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode(raw & r) {
         using namespace grouped_gemm_esimd;
         simd<float, GROUPED_GEMM_RC> d = r.d.template select<GROUPED_GEMM_RC, 1>(g * GROUPED_GEMM_RC),
                                      m = r.m.template select<GROUPED_GEMM_RC, 1>(g * GROUPED_GEMM_RC);
-        return halves_dm(r.q.template select<GROUPED_GEMM_RC * 8, 1>(g * GROUPED_GEMM_RC * 8), d, m, d, m);
+        simd<uint32_t, GROUPED_GEMM_RC * 8> q =
+            (r.q.template select<GROUPED_GEMM_RC * 8, 1>(g * GROUPED_GEMM_RC * 8) >> r.sh) & (MASK * 0x01010101u);
+        return halves_dm(q, d, m, d, m);
     }
 };
 
@@ -586,11 +809,15 @@ template <int MR> struct grouped_gemm_esimd_a<block_q5_K, MR> {
         simd<uint32_t, MR * 8> qh = s.template rows<8>(QH, ib, 0);
         r.q = ((s.template rows<8>(QS, ib, 32 * (j / 2)) >> (4 * (j & 1))) & 0x0F0F0F0Fu) |
               (((qh >> j) & 0x01010101u) << 4);
+        r.sh = 0;
         q4::scale_min(sb, j, r.d, r.m);
     }
 
     template <int g> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode(raw & r) {
-        return q4::template decode<g>(r);
+        return q4::template decode<g, 0x1F>(r);
+    }
+    template <int g> static ESIMD_INLINE grouped_gemm_esimd::a_halves decode_fast(raw & r) {
+        return q4::template decode_fast_m<g, 0x1F>(r);
     }
 };
 
@@ -827,8 +1054,40 @@ template <int MR> struct grouped_gemm_esimd_a<block_iq3_xxs, MR> {
 // T is the dpas operand type, sycl::half or bfloat16: the type B is packed in. A is decoded in half
 // either way and converted for bf16 (see the double rounding note at the conversion). AOS: the weight
 // is in the canonical block layout rather than the reorder (SoA) one. A: the grouped_gemm_arch built for.
-template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct grouped_gemm_esimd_kernel {
-    using F = grouped_gemm_esimd_a<block_q_t, A::MR>;
+// P: schedule tiles of one thread. P == 2 pairs tiles 2i and 2i + 1 of an expert in one thread (of MRT rows),
+// which halves the A decode and load per output; eoff (the schedule's expert offsets) finds a tile's place in
+// its expert. PF: the distance in k steps of the B prefetch, 0 for none.
+// SE: the SiTU epilogue (ggml_sycl_grouped_gemm_situ_out): the thread's rows are two slices of MRT / 2, x
+// rows epi.x0 + i and g rows epi.g0 + i, and it writes situ(x, g) to the next projection's packed B instead
+// of dst. GB (with SE): B is gathered from epi.b16, the rows of the routed tokens, rather than loaded from
+// the packed B; a lane is a column, its 8 dwords 16 k values, which is the dpas B layout.
+// V (with GB): variant bits of the gathered-B kernel, 0 its first form. 1: q4_K's no-shift decode
+// (GGML_SYCL_Q4K_NOSHIFT). 2: B gathered through 64-bit addresses whose k step and half offsets are
+// the messages' immediates (GGML_SYCL_GB_A64). 4: a pair with no second tile skips its half of the
+// gathers and dpas (GGML_SYCL_GB_HALFSKIP).
+template <typename block_q_t, int KS, typename T, bool AOS, typename A, int P = 1, int MRT = A::MR, int PF = 0,
+          bool SE = false, bool GB = false, int V = 0>
+struct grouped_gemm_esimd_kernel {
+    // P == 4 (GGML_SYCL_GB_WIDE): 4 schedule tiles (128 columns) a thread of 16 rows, 8 x and 8 g (the q4_K
+    // gathered-B SiTU kernel only), so each decoded A register feeds twice the paired thread's dpas. Its x and g
+    // rows are one slice of two row runs, so the scales of both take one SIMD16 pass. The work-group's B is
+    // gathered once, a k step ahead, into SLM (each of its 16 threads one [8 k pairs][16 columns] block), and
+    // every thread reads it from there: two buffers, a split barrier a k step. Each accumulator takes the k step's
+    // two dpas in k order, so the sums are the paired kernel's bits.
+    static constexpr bool WIDE = P == 4;
+    static constexpr bool WSLM       = WIDE && (V & 16);
+    static constexpr int  WSLM_BLK   = 8 * 16 * 4;          // bytes of one k16 half of 16 columns
+    static constexpr int  WSLM_BUF   = 16 * WSLM_BLK;       // one k step of 128 columns
+    static constexpr int MR_ = MRT;
+    static constexpr int NS  = (SE && !WIDE) ? 2 : 1;  // row slices of a thread
+    static constexpr int MS  = MR_ / NS;               // rows of a slice
+    static constexpr int XR  = SE ? MR_ / 2 : MR_;     // x rows of a thread (SE), its rows otherwise
+    using F = grouped_gemm_esimd_a<block_q_t, MS>;
+    static_assert(!SE || (KS == 1 && !F::whole && std::is_same_v<T, sycl::half>), "the SiTU epilogue's cases");
+    static_assert(!GB || SE, "the gathered B comes with the SiTU epilogue");
+    static_assert(!WIDE || (WSLM && GB && (V & 2) && (V & 1) && std::is_same_v<block_q_t, block_q4_K> &&
+                            GGML_SYCL_GROUPED_GEMM_BN * P == 128),
+                  "the wide thread is the q4_K gathered-B kernel's, with 64-bit addresses");
 
     const char *              src0_dd;
     size_t                    expert_stride;
@@ -839,6 +1098,8 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
     int                       Npad;
     int                       K;
     ggml_sycl_grouped_gemm_rows         dst_rows;
+    const uint32_t *          eoff;
+    ggml_sycl_grouped_gemm_situ_out epi;
 
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
         if constexpr (grouped_gemm_built<A>()) {
@@ -846,44 +1107,75 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
         }
     }
 
+    // the WSLM split barrier: the signal after a k step's SLM stores (fenced), the wait before its reads, so the
+    // A decode of the next k step runs while the work-group gathers
+    static ESIMD_INLINE void wslm_signal() {
+        namespace ex = sycl::ext::intel::experimental::esimd;
+        sycl::ext::intel::esimd::fence<sycl::ext::intel::esimd::memory_kind::local>();
+        ex::split_barrier<ex::split_barrier_action::signal>();
+    }
+    static ESIMD_INLINE void wslm_wait() {
+        namespace ex = sycl::ext::intel::experimental::esimd;
+        ex::split_barrier<ex::split_barrier_action::wait>();
+    }
+
     ESIMD_INLINE void run(sycl::nd_item<1> it) const {
         using namespace sycl::ext::intel::esimd;
         namespace xmx = sycl::ext::intel::esimd::xmx;
-        constexpr int MR = A::MR;
+        constexpr int MR = MR_;
         constexpr int NW = A::NW;
         constexpr int RC = GROUPED_GEMM_RC;
         constexpr int RG = MR / RC; // dpas row groups of this thread
-        constexpr int BN = GGML_SYCL_GROUPED_GEMM_BN;
+        constexpr int BN = GGML_SYCL_GROUPED_GEMM_BN * P;
         constexpr int NT = BN / NW;
 
+        if constexpr (WSLM) {
+            slm_init<2 * WSLM_BUF>();
+        }
         if constexpr (F::slm_bytes > 0) {
             // the format's lookup table; a work-group is one thread, so nothing else writes it
+            // every thread of the work-group writes the same table
             slm_init<F::slm_bytes>();
             F::init_slm();
+            barrier();
         }
 
-        const int mblocks = M / MR;
+        const int mblocks = SE ? epi.D / XR : M / MR;
         const int gid     = it.get_global_id(0);
         const int t       = gid / mblocks;
-        const int m0      = (gid % mblocks) * MR;
+        const int mb      = gid % mblocks;
+        const int m0      = mb * MR;
 
-        const ggml_sycl_grouped_gemm_tile tile = tiles[t];
+        ggml_sycl_grouped_gemm_tile tile = tiles[t];
         if (tile.n1 <= tile.n0) {
             return;
         }
-        const int b0 = t * BN; // the tile's packed-B columns
+        if constexpr (P > 1) {
+            // the tiles of an expert after the first of each group of P belong to that first one's thread;
+            // the group ends where the expert does
+            const uint32_t e0 = eoff[tile.expert];
+            const uint32_t e1 = eoff[tile.expert + 1];
+            if ((((uint32_t) tile.n0 - e0) / GGML_SYCL_GROUPED_GEMM_BN) % P) {
+                return;
+            }
+            tile.n1 = (int) std::min<uint32_t>(e1, (uint32_t) tile.n0 + BN);
+        }
+        const int b0 = t * GGML_SYCL_GROUPED_GEMM_BN; // the tile's packed-B columns
 
         // the slice of this expert
         const int             bpr = K / F::qk;
-        const grouped_gemm_esimd::slice<MR, A::L2D> sl  = {
-            (const uint8_t *) src0_dd + (size_t) tile.expert * expert_stride,
-            M,
-            bpr,
-            M * bpr,
-            m0,
-            AOS,
-            (int) sizeof(block_q_t)
-        };
+        grouped_gemm_esimd::slice<MS, A::L2D> sl[NS];
+#pragma unroll
+        for (int s = 0; s < NS; ++s) {
+            sl[s] = { (const uint8_t *) src0_dd + (size_t) tile.expert * expert_stride,
+                      M,
+                      bpr,
+                      M * bpr,
+                      SE ? (s == 0 ? epi.x0 : epi.g0) + mb * XR : m0,
+                      AOS,
+                      (int) sizeof(block_q_t),
+                      WIDE ? epi.g0 + mb * XR : -1 };
+        }
         const uint32_t *      bp  = (const uint32_t *) packed;
         const unsigned        bw  = (unsigned) Npad * 4; // bytes of one packed B row
         const int             nstep = K / GROUPED_GEMM_QK;
@@ -906,6 +1198,8 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
         const int          ncols = tile.n1 - tile.n0;
         simd_mask<BN>      cm    = simd<int32_t, BN>(0, 1) < ncols;
         simd<int32_t, BN>  i2 = 0, r1 = 0; // r1: the dst row slot, i1 % ne1
+        simd<uint32_t, BN> boff = 0;       // GB: byte offset of each column's B row in epi.b16
+        simd<float, BN>    wv   = 1.0f;    // dst_rows.w: the router weight of each column
         if (dst_rows.map) {
             const int32_t *    mp = (const int32_t *) (dst_rows.map + tile.n0);
             simd<uint32_t, BN> mo(0, sizeof(mmid_row_mapping));
@@ -914,6 +1208,20 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
             // once per thread in 32 bits: a 64-bit modulo per column is emulated, and at 20 columns a
             // tile it cost more than the whole GEMM (7.2 vs 3.1 ms)
             r1 = i1 % simd<int32_t, BN>((int32_t) dst_rows.ne1);
+            if constexpr (!SE) {
+                if (dst_rows.w) {
+                    // the router weight of each route column, for the combine's half rows (see the store below)
+                    const simd<uint32_t, BN> wo = simd<uint32_t, BN>(r1) * (uint32_t) dst_rows.w_nb1 +
+                                                  simd<uint32_t, BN>(i2) * (uint32_t) dst_rows.w_nb2;
+                    wv = gather<float, BN>((const float *) dst_rows.w, wo, cm);
+                }
+            }
+            if constexpr (GB) {
+                // columns past the tile read row 0; their results are not stored
+                simd<int32_t, BN> row = i1 % simd<int32_t, BN>(epi.b_ne1) + i2 * epi.b_ne1;
+                row.merge(simd<int32_t, BN>(0), simd<int32_t, BN>(0, 1) >= ncols);
+                boff = simd<uint32_t, BN>(row) * (uint32_t) (K * sizeof(T));
+            }
         }
 
         // One k step at a time: the format's stored bits for the MR rows, and the 16 k pairs x NW
@@ -928,19 +1236,127 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
         constexpr int    KPB       = F::qk / GROUPED_GEMM_QK;  // k steps per stored block
         int           split     = 0;
         int           split_end = KS > 1 ? nstep / KS : nstep;
-        typename F::sb_t sb;
+        typename F::sb_t sb[NS];
+        // NTL: the column tiles the loop computes; a gathered-B pair whose second tile is empty (V & 4)
+        // gathers and multiplies the first tile's only
+        const auto cached = syclex::properties{ cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached> };
+        const int  li     = WSLM ? (int) it.get_local_id(0) : 0;  // WSLM: the B block this thread stages
+        simd<uint64_t, NW> ma = 0;
+        if constexpr (WSLM) {
+            const simd<uint32_t, NW> mo = boff.template select<NW, 1>((li >> 1) * NW);
+            ma = simd<uint64_t, NW>(mo) + (uint64_t) ((uintptr_t) epi.b16 + (size_t) ((li & 1) * 32));
+        }
+        bool stager = false;
+        auto k_loop = [&](auto ntc) SYCL_ESIMD_FUNCTION {
+        constexpr int NTL = decltype(ntc)::value;
+        if constexpr (WSLM) {
+            stager = (li >> 1) < NTL;
+            if (stager) {
+                simd<uint32_t, 8 * NW> v = gather<uint32_t, 8 * NW, 8>((const uint32_t *) nullptr, ma, cached);
+                slm_block_store<uint64_t, 8 * NW / 2>(li * WSLM_BLK, v.template bit_cast_view<uint64_t>());
+            }
+            wslm_signal();
+        }
         for (int kb = 0; kb < nstep; ++kb) {
             const int j = kb % KPB;
-            if (j == 0) {
-                F::load_sb(sb, sl, kb / KPB);
-            }
-            typename F::raw r;
-            F::load(r, sb, sl, kb, j);
-            simd<uint32_t, 16 * NW> b[NT]; // [16 k pairs][NW columns] each
-            if constexpr (A::L2D) {
+            typename F::raw r[NS];
 #pragma unroll
-                for (int nt = 0; nt < NT; ++nt) {
-                    b[nt] = load_2d<uint32_t, NW, 16>(bp, bw - 1, K / 2 - 1, bw - 1, b0 + nt * NW, kb * 16);
+            for (int s = 0; s < NS; ++s) {
+                if (j == 0) {
+                    F::load_sb(sb[s], sl[s], kb / KPB);
+                }
+                F::load(r[s], sb[s], sl[s], kb, j);
+            }
+            if constexpr (WSLM) {
+                const bool more = kb + 1 < nstep;
+                simd<uint32_t, 8 * NW> nxt;
+                if (stager && more) {
+                    nxt = gather<uint32_t, 8 * NW, 8>((const uint32_t *) nullptr,
+                                                      simd<uint64_t, NW>(ma + (uint64_t) ((size_t) (kb + 1) * 64)),
+                                                      cached);
+                }
+                grouped_gemm_esimd::a_halves av[RG];
+                auto dec = [&](auto gc) SYCL_ESIMD_FUNCTION {
+                    constexpr int g  = decltype(gc)::value;
+                    constexpr int s  = g / (RG / NS);
+                    constexpr int gs = g % (RG / NS);
+                    av[g]            = F::template decode_fast_ns<gs>(r[s]);
+                };
+                grouped_gemm_esimd::static_for<0, RG>::run(dec);
+                // the stores of the previous k step are in, and its reads of the other buffer are done
+                wslm_wait();
+                const uint32_t rb = (uint32_t) (kb & 1) * WSLM_BUF;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                    for (int nt = 0; nt < NTL; ++nt) {
+                        simd<uint64_t, 8 * NW / 2> b64 =
+                            slm_block_load<uint64_t, 8 * NW / 2>(rb + (nt * 2 + h) * WSLM_BLK);
+                        simd<T, 16 * NW>                 bv  = b64.template bit_cast_view<T>();
+#pragma unroll
+                        for (int g = 0; g < RG; ++g) {
+                            simd<sycl::half, RC * 16> ah = av[g].template select<RC * 16, 1>(h * RC * 16);
+                            acc[g][nt] = xmx::dpas<8, RC, float, float>(acc[g][nt], bv, ah);
+                        }
+                    }
+                }
+                if (more) {
+                    if (stager) {
+                        slm_block_store<uint64_t, 8 * NW / 2>((WSLM_BUF - rb) + li * WSLM_BLK,
+                                                              nxt.template bit_cast_view<uint64_t>());
+                    }
+                    wslm_signal();
+                }
+                continue;
+            }
+            simd<uint32_t, 16 * NW> b[NT]; // [16 k pairs][NW columns] each
+            if constexpr (GB) {
+                const uint32_t * bg = (const uint32_t *) epi.b16;
+#pragma unroll
+                for (int nt = 0; nt < NTL; ++nt) {
+                    if constexpr (V & 2) {
+                        // the column's B address at this k step; the prefetch distance and the k16 half
+                        // are constant offsets the messages take as immediates
+                        const simd<uint64_t, NW> a = simd<uint64_t, NW>(boff.template select<NW, 1>(nt * NW)) +
+                                                     (uint64_t) ((uintptr_t) bg + (size_t) kb * 64);
+                        const auto cached = syclex::properties{ cache_hint_L1<cache_hint::cached>,
+                                                                cache_hint_L2<cache_hint::cached> };
+                        if constexpr (PF > 0) {
+                            prefetch<uint32_t, NW, 1>((const uint32_t *) nullptr, simd<uint64_t, NW>(a + (uint64_t) (PF * 64)), cached);
+                        }
+                        b[nt].template select<8 * NW, 1>(0) = gather<uint32_t, 8 * NW, 8>((const uint32_t *) nullptr, a, cached);
+                        b[nt].template select<8 * NW, 1>(8 * NW) =
+                            gather<uint32_t, 8 * NW, 8>((const uint32_t *) nullptr, simd<uint64_t, NW>(a + (uint64_t) 32), cached);
+                        continue;
+                    }
+                    // a lane reads its column's 64 bytes of the k step; gathers take at most 8 dwords a lane
+                    const simd<uint32_t, NW> o = boff.template select<NW, 1>(nt * NW) + (uint32_t) (kb * 64);
+                    if constexpr (PF > 0) {
+                        prefetch<uint32_t, NW, 1>(bg, o + (uint32_t) (PF * 64),
+                            syclex::properties{ cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached> });
+                    }
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        // [8 k pairs][NW columns] of k16 half h
+                        b[nt].template select<8 * NW, 1>(h * 8 * NW) = gather<uint32_t, 8 * NW, 8>(bg, o + (uint32_t) (h * 32),
+                            syclex::properties{ cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached> });
+                    }
+                }
+            } else if constexpr (A::L2D && PF > 0) {
+                // B of a later k step into the cache, so its load does not wait on L2
+#pragma unroll
+                for (int nt = 0; nt < NTL; ++nt) {
+                    prefetch_2d<uint32_t, NW, 16>(bp, bw - 1, K / 2 - 1, bw - 1, b0 + nt * NW, (kb + PF) * 16,
+                        syclex::properties{ cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached> });
+                }
+            }
+            if constexpr (GB) {
+            } else if constexpr (A::L2D) {
+#pragma unroll
+                for (int nt = 0; nt < NTL; ++nt) {
+                    // cached in L1: the threads of a work-group read the same B
+                    b[nt] = load_2d<uint32_t, NW, 16>(bp, bw - 1, K / 2 - 1, bw - 1, b0 + nt * NW, kb * 16,
+                        syclex::properties{ cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached> });
                 }
             } else {
                 simd<uint32_t, 16 * BN> bm;
@@ -957,20 +1373,26 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
             }
             simd<sycl::half, MR * GROUPED_GEMM_QK> all;
             if constexpr (F::whole) {
-                all = F::decode_all(r);
+                all = F::decode_all(r[0]);
             }
             // one row group of the thread, g a compile-time constant: with a runtime g the larger
             // decodes were left rolled
             auto row_group = [&](auto gc) SYCL_ESIMD_FUNCTION {
-                constexpr int g = decltype(gc)::value;
+                constexpr int g  = decltype(gc)::value;
+                constexpr int s  = g / (RG / NS);  // the slice and its row group
+                constexpr int gs = g % (RG / NS);
                 grouped_gemm_esimd::a_halves av;
                 if constexpr (F::whole) {
                     // [row][32 k] of the whole tile to this row group's [k half][row][16 k]
                     auto am = all.template bit_cast_view<sycl::half, MR, GROUPED_GEMM_QK>();
                     av.template select<RC * 16, 1>(0)       = am.template select<RC, 1, 16, 1>(g * RC, 0);
                     av.template select<RC * 16, 1>(RC * 16) = am.template select<RC, 1, 16, 1>(g * RC, 16);
+                } else if constexpr ((V & 1) && std::is_same_v<block_q_t, block_q4_K>) {
+                    av = F::template decode_fast_ns<gs>(r[s]);
+                } else if constexpr (KS == 1 && grouped_gemm_has_fast<F>::value) {
+                    av = F::template decode_fast<gs>(r[s]);
                 } else {
-                    av = F::template decode<g>(r);
+                    av = F::template decode<gs>(r[s]);
                 }
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
@@ -985,7 +1407,7 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
                         at = simd<float, RC * 16>(ah);
                     }
 #pragma unroll
-                    for (int nt = 0; nt < NT; ++nt) {
+                    for (int nt = 0; nt < NTL; ++nt) {
                         simd<uint32_t, 8 * NW> bh32 = b[nt].template select<8 * NW, 1>(h * 8 * NW);
                         simd<T, 16 * NW>       bh   = bh32.template bit_cast_view<T>();
                         acc[g][nt] = xmx::dpas<8, RC, float, float>(acc[g][nt], bh, at);
@@ -1009,8 +1431,77 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
                 }
             }
         }
+        };
+        if constexpr (WIDE) {
+            // only the column tiles the group's tiles cover (the generalised half-skip)
+            switch ((ncols + 2 * NW - 1) / (2 * NW)) {
+                case 1: k_loop(std::integral_constant<int, 2>{}); break;
+                case 2: k_loop(std::integral_constant<int, 4>{}); break;
+                case 3: k_loop(std::integral_constant<int, 6>{}); break;
+                default: k_loop(std::integral_constant<int, 8>{}); break;
+            }
+        } else if constexpr (P == 2 && (V & 4) && (GB || A::L2D)) {
+            if (ncols > GGML_SYCL_GROUPED_GEMM_BN) {
+                k_loop(std::integral_constant<int, NT>{});
+            } else {
+                k_loop(std::integral_constant<int, NT / 2>{});
+            }
+        } else {
+            k_loop(std::integral_constant<int, NT>{});
+        }
         (void) split;
         (void) split_end;
+
+        if constexpr (SE) {
+            // row groups [0, RG/2) hold x rows mb*MS.. of the SiTU, [RG/2, RG) the g rows of the same i; the
+            // f32 SiTU of grouped_gemm_pack_b_device, rounded to T and stored as the down pack's
+            // [i/2][column][2]. A pair's second tile is another expert's unless the pair has its columns.
+            constexpr int RH  = RG / 2;
+            uint32_t *    ob  = (uint32_t *) epi.out;
+            const float   beta = epi.beta, lb = epi.lb;
+            const float   inv_beta = 1.0f / beta, inv_lb = lb > 0.0f ? 1.0f / lb : 0.0f;
+            const int     kq0 = mb * XR / 2;
+            // the column tiles of the schedule tiles this thread owns; the ones after belong to another expert
+            const int     ntw = P == 1 ? NT :
+                                         ((ncols + GGML_SYCL_GROUPED_GEMM_BN - 1) / GGML_SYCL_GROUPED_GEMM_BN) *
+                                             (GGML_SYCL_GROUPED_GEMM_BN / NW);
+            using vf = simd<float, RC * NW>;
+            auto tanh_ = [](vf y) SYCL_ESIMD_FUNCTION {
+                const vf t = exp(-2.0f * abs(y));
+                vf       r = (1.0f - t) / (1.0f + t);
+                r.template bit_cast_view<uint32_t>() |= y.template bit_cast_view<uint32_t>() & 0x80000000u;
+                return r;
+            };
+#pragma unroll
+            for (int gx = 0; gx < RH; ++gx) {
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    if (nt >= ntw) {
+                        continue;
+                    }
+                    const vf xv  = acc[gx][nt];
+                    vf       gv  = acc[gx + RH][nt];
+                    const vf act = tanh_(xv * inv_beta) * beta * (1.0f / (1.0f + exp(-xv)));
+                    if (lb > 0.0f) {
+                        gv = tanh_(gv * inv_lb) * lb;
+                    }
+                    simd<T, RC * NW>       h = act * gv;  // [row][column]
+                    simd<T, RC * NW>       w;             // [row pair][column][2]
+#pragma unroll
+                    for (int q = 0; q < RC / 2; ++q) {
+                        w.template select<NW, 2>(q * 2 * NW)     = h.template select<NW, 1>(2 * q * NW);
+                        w.template select<NW, 2>(q * 2 * NW + 1) = h.template select<NW, 1>((2 * q + 1) * NW);
+                    }
+                    auto w32 = w.template bit_cast_view<uint32_t>();
+#pragma unroll
+                    for (int q = 0; q < RC / 2; ++q) {
+                        block_store<uint32_t, NW>(ob + (size_t) (kq0 + gx * RC / 2 + q) * Npad + b0 + nt * NW,
+                                                  w32.template select<NW, 1>(q * NW), overaligned_tag<16>{});
+                    }
+                }
+            }
+            return;
+        }
 
         // column c of the tile: MR consecutive floats of one dst row. Unrolled, so c indexes the
         // accumulators at compile time; a runtime index sends them all to private memory.
@@ -1030,8 +1521,16 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
             }
             const int n = tile.n0 + c;
             if (dst_rows.map) {
-                float * out = (float *) (dst_rows.base + (size_t) r1[c] * dst_rows.nb1 + i2[c] * dst_rows.nb2) + m0;
-                block_store<float, MR>(out, col, element_aligned_tag{});
+                char * row = dst_rows.base + (size_t) r1[c] * dst_rows.nb1 + (size_t) i2[c] * dst_rows.nb2;
+                if (dst_rows.w) {
+                    // the MoE combine's first half: the route's output times its router weight in f32, rounded
+                    // to half once; the combine sums the half rows of a token in slot order
+                    const float wc = wv[c];
+                    const simd<sycl::half, MR> h = col * wc;
+                    block_store<sycl::half, MR>((sycl::half *) row + m0, h, element_aligned_tag{});
+                } else {
+                    block_store<float, MR>((float *) row + m0, col, element_aligned_tag{});
+                }
             } else {
                 block_store<float, MR>(dst + (size_t) n * M + m0, col, element_aligned_tag{});
             }
@@ -1040,6 +1539,69 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
 
     auto get(syclexp::properties_tag) const { return syclexp::properties{ sycl::ext::intel::experimental::grf_size<256> }; }
 };
+
+// The paired launch (P == 2) of a format on Xe2: rows of a thread, B prefetch distance in k steps (0 none),
+// threads of a work-group (consecutive row blocks of one tile pair, which share its B in L1). B70, Inkling
+// ub2048: q4_K 2304x2304 2.86 -> 1.99 ms, q5_0 1152 -> 2304 1.93 -> 1.46, q8_0 1.48 -> 1.36. Formats
+// not listed keep the one-tile launch.
+// epi: the format has the SiTU epilogue (the MoE gate_up formats; each adds kernels to compile), GPF its
+// prefetch distance when B is gathered (q4_K: 1975 us a call from packed B, 2135 gathered, 2095 at GPF 2,
+// 2127 at 4).
+template <typename block_q_t> struct grouped_gemm_esimd_pair_cfg {
+    static constexpr bool on = false, epi = false;
+    static constexpr int  MR = GROUPED_GEMM_MR, PF = 0, WG = 1, GPF = 0;
+};
+template <> struct grouped_gemm_esimd_pair_cfg<block_q4_K> {
+    static constexpr bool on = true, epi = true;
+    static constexpr int  MR = 32, PF = 2, WG = 8, GPF = 2;
+};
+template <> struct grouped_gemm_esimd_pair_cfg<block_q5_0> {
+    static constexpr bool on = true, epi = false;
+    static constexpr int  MR = 32, PF = 0, WG = 8, GPF = 0;
+};
+template <> struct grouped_gemm_esimd_pair_cfg<block_q8_0> {
+    static constexpr bool on = true, epi = false;
+    static constexpr int  MR = 32, PF = 2, WG = 8, GPF = 0;
+};
+
+static int grouped_gemm_esimd_pair_env() {
+    static const int v = [] {
+        const char * e = getenv("GGML_SYCL_MMID_PAIR");
+        return e ? atoi(e) : 1;
+    }();
+    return v;
+}
+
+// the gathered-B kernel's variant bits (see grouped_gemm_esimd_kernel's V), each on by default
+static int grouped_gemm_esimd_gb_variant() {
+    static const int v = [] {
+        auto on = [](const char * n) {
+            const char * e = getenv(n);
+            return !e || atoi(e) != 0;
+        };
+        return (on("GGML_SYCL_Q4K_NOSHIFT") ? 1 : 0) | (on("GGML_SYCL_GB_A64") ? 2 : 0) |
+               (on("GGML_SYCL_GB_HALFSKIP") ? 4 : 0);
+    }();
+    return v;
+}
+
+// GGML_SYCL_GB_WIDE: 0 keeps the paired q4_K gate_up thread, else the 4-tile thread with B in SLM
+static bool grouped_gemm_esimd_wide() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_SYCL_GB_WIDE");
+        return !e || atoi(e) != 0;
+    }();
+    return v;
+}
+
+// GGML_SYCL_DOWN_HALFSKIP: 0 keeps the paired plain (down) GEMM computing both tiles of every pair
+static bool grouped_gemm_esimd_down_halfskip() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_SYCL_DOWN_HALFSKIP");
+        return !e || atoi(e) != 0;
+    }();
+    return v;
+}
 
 // the weights' surfaces: 2D block loads (SoA with L2D) want 64-byte aligned bases, the dword gathers 4
 static bool grouped_gemm_esimd_weights_ok(const char * w, const size_t expert_stride, const bool l2d) {
@@ -1061,7 +1623,7 @@ bool ggml_sycl_grouped_gemm_esimd_enabled() {
 }
 
 template <typename block_q_t, typename T, bool AOS, typename A>
-static void grouped_gemm_esimd_launch(const char *                        src0_dd,
+static bool grouped_gemm_esimd_launch(const char *                        src0_dd,
                                       size_t                              expert_stride,
                                       const ggml_sycl_grouped_gemm_tile * tiles,
                                       const T *                           packed,
@@ -1071,15 +1633,83 @@ static void grouped_gemm_esimd_launch(const char *                        src0_d
                                       int                                 K,
                                       const ggml_sycl_grouped_gemm_rows & dst_rows,
                                       int64_t                             n_tiles,
-                                      dpct::queue_ptr                     stream) {
-    const sycl::nd_range<1> range((size_t) n_tiles * (M / A::MR), 1);
-    if (ggml_sycl_grouped_gemm_esimd_mode() == 2) {
-        stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, GGML_SYCL_GROUPED_GEMM_KSPLIT, T, AOS, A>{
-                                        src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows });
-    } else {
-        stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A>{
-                                        src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows });
+                                      dpct::queue_ptr                     stream,
+                                      const uint32_t *                    eoff,
+                                      const ggml_sycl_grouped_gemm_situ_out * epi) {
+    using C = grouped_gemm_esimd_pair_cfg<block_q_t>;
+    if (epi) {
+        // the paired launch only; the caller packs and runs the plain GEMM otherwise
+        if constexpr (C::on && C::epi && A::L2D && std::is_same_v<T, sycl::half>) {
+            constexpr int MS = C::MR / 2;
+            if (ggml_sycl_grouped_gemm_esimd_mode() != 2 && eoff && grouped_gemm_esimd_pair_env() &&
+                epi->D % (MS * C::WG) == 0 && epi->x0 % MS == 0 && epi->g0 % MS == 0 && epi->D % 2 == 0 &&
+                ((uintptr_t) epi->out % 64) == 0) {
+                const sycl::nd_range<1> range((size_t) n_tiles * (epi->D / MS), (size_t) C::WG);
+                if (epi->b16) {
+                    if constexpr (std::is_same_v<block_q_t, block_q4_K>) {
+                        // 4 tiles (128 columns) of 16 rows (8 x, 8 g) a thread in work-groups of 16 (GGML_SYCL_GB_WIDE;
+                        // with every other variant bit on)
+                        constexpr int WG = 16;
+                        if (grouped_gemm_esimd_wide() && grouped_gemm_esimd_gb_variant() == 7 && epi->D % (8 * WG) == 0 &&
+                            epi->x0 % 8 == 0 && epi->g0 % 8 == 0) {
+                            const sycl::nd_range<1> wrange((size_t) n_tiles * (epi->D / 8), (size_t) WG);
+                            stream->parallel_for(wrange,
+                                grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A, 4, 16, C::GPF, true, true, 23>{
+                                    src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows, eoff, *epi });
+                            return true;
+                        }
+                    }
+                    auto go = [&](auto vc) {
+                        constexpr int V = decltype(vc)::value;
+                        stream->parallel_for(range,
+                            grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A, 2, C::MR, C::GPF, true, true, V>{
+                                src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows, eoff, *epi });
+                    };
+                    switch (grouped_gemm_esimd_gb_variant()) {
+                        case 1: go(std::integral_constant<int, 1>{}); break;
+                        case 2: go(std::integral_constant<int, 2>{}); break;
+                        case 3: go(std::integral_constant<int, 3>{}); break;
+                        case 4: go(std::integral_constant<int, 4>{}); break;
+                        case 5: go(std::integral_constant<int, 5>{}); break;
+                        case 6: go(std::integral_constant<int, 6>{}); break;
+                        case 7: go(std::integral_constant<int, 7>{}); break;
+                        default: go(std::integral_constant<int, 0>{}); break;
+                    }
+                } else {
+                    stream->parallel_for(range,
+                        grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A, 2, C::MR, C::PF, true>{
+                            src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows, eoff, *epi });
+                }
+                return true;
+            }
+        }
+        return false;
     }
+    if (ggml_sycl_grouped_gemm_esimd_mode() == 2) {
+        const sycl::nd_range<1> range((size_t) n_tiles * (M / A::MR), 1);
+        stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, GGML_SYCL_GROUPED_GEMM_KSPLIT, T, AOS, A>{
+                                        src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows, nullptr, {} });
+        return true;
+    }
+    if constexpr (C::on && A::L2D) {
+        // a work-group is WG consecutive row blocks of one tile, so the row-block count must divide by it
+        if (eoff && grouped_gemm_esimd_pair_env() && M % (C::MR * C::WG) == 0) {
+            const sycl::nd_range<1> range((size_t) n_tiles * (M / C::MR), (size_t) C::WG);
+            if (grouped_gemm_esimd_down_halfskip()) {
+                // V & 4: a pair whose second tile is another expert's loads and multiplies the first tile only
+                stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A, 2, C::MR, C::PF, false, false, 4>{
+                                                src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows, eoff, {} });
+                return true;
+            }
+            stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A, 2, C::MR, C::PF>{
+                                            src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows, eoff, {} });
+            return true;
+        }
+    }
+    const sycl::nd_range<1> range((size_t) n_tiles * (M / A::MR), 1);
+    stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS, A>{
+                                    src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, dst_rows, nullptr, {} });
+    return true;
 }
 
 template <typename block_q_t, typename T, typename A>
@@ -1094,7 +1724,9 @@ static bool grouped_gemm_esimd_run(const char *                        src0_dd,
                                    const ggml_sycl_grouped_gemm_rows & dst_rows,
                                    bool                                reordered,
                                    int64_t                             n_tiles,
-                                   dpct::queue_ptr                     stream) {
+                                   dpct::queue_ptr                     stream,
+                                   const uint32_t *                    eoff,
+                                   const ggml_sycl_grouped_gemm_situ_out * epi) {
     using F = grouped_gemm_esimd_a<block_q_t, A::MR>;
     // whole row groups and stored blocks, every K-split range non-empty (also in mode 1, so both
     // modes take the same shapes); B is read with 2D block loads, which want 64-byte aligned
@@ -1105,13 +1737,11 @@ static bool grouped_gemm_esimd_run(const char *                        src0_dd,
         return false;
     }
     if (reordered) {
-        grouped_gemm_esimd_launch<block_q_t, T, false, A>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K,
-                                                          dst_rows, n_tiles, stream);
-    } else {
-        grouped_gemm_esimd_launch<block_q_t, T, true, A>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K,
-                                                         dst_rows, n_tiles, stream);
+        return grouped_gemm_esimd_launch<block_q_t, T, false, A>(src0_dd, expert_stride, tiles, packed, dst, M, Npad,
+                                                                 K, dst_rows, n_tiles, stream, eoff, epi);
     }
-    return true;
+    return grouped_gemm_esimd_launch<block_q_t, T, true, A>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K,
+                                                            dst_rows, n_tiles, stream, eoff, epi);
 }
 
 template <typename block_q_t, typename T, int NW>
@@ -1126,29 +1756,33 @@ bool ggml_sycl_grouped_gemm_esimd(const char *                        src0_dd,
                                   const ggml_sycl_grouped_gemm_rows & dst_rows,
                                   bool                                reordered,
                                   int64_t                             n_tiles,
-                                  dpct::queue_ptr                     stream) {
+                                  dpct::queue_ptr                     stream,
+                                  const uint32_t *                    eoff,
+                                  const ggml_sycl_grouped_gemm_situ_out * epi) {
     static_assert(grouped_gemm_esimd_a<block_q_t>::supported == ggml_sycl_grouped_gemm_esimd_has<block_q_t>,
                   "the header's format list and the formats implemented here must agree");
     static_assert(NW == 8 || NW == 16, "the dpas widths of Xe-HPG and of Xe2 / Xe-HPC");
     if constexpr (NW == 16) {
         return grouped_gemm_esimd_run<block_q_t, T, grouped_gemm_xe2>(src0_dd, expert_stride, tiles, packed, dst, M,
-                                                                      Npad, K, dst_rows, reordered, n_tiles, stream);
+                                                                      Npad, K, dst_rows, reordered, n_tiles, stream, eoff, epi);
     } else {
         return grouped_gemm_esimd_run<block_q_t, T, grouped_gemm_xehpg>(src0_dd, expert_stride, tiles, packed, dst, M,
-                                                                        Npad, K, dst_rows, reordered, n_tiles, stream);
+                                                                        Npad, K, dst_rows, reordered, n_tiles, stream, eoff, epi);
     }
 }
 
 #define GROUPED_GEMM_ESIMD_INSTANCE_T(block_q_t, T, NW)                                               \
     template bool ggml_sycl_grouped_gemm_esimd<block_q_t, T, NW>(                                     \
         const char *, size_t, const ggml_sycl_grouped_gemm_tile *, const T *, float *, int, int, int, \
-        const ggml_sycl_grouped_gemm_rows &, bool, int64_t, dpct::queue_ptr);
+        const ggml_sycl_grouped_gemm_rows &, bool, int64_t, dpct::queue_ptr, const uint32_t *,     \
+        const ggml_sycl_grouped_gemm_situ_out *);
 #define GROUPED_GEMM_ESIMD_INSTANCE(block_q_t)                                \
     GROUPED_GEMM_ESIMD_INSTANCE_T(block_q_t, sycl::half, 16)                  \
     GROUPED_GEMM_ESIMD_INSTANCE_T(block_q_t, sycl::ext::oneapi::bfloat16, 16) \
     GROUPED_GEMM_ESIMD_INSTANCE_T(block_q_t, sycl::half, 8)                   \
     GROUPED_GEMM_ESIMD_INSTANCE_T(block_q_t, sycl::ext::oneapi::bfloat16, 8)
 GROUPED_GEMM_ESIMD_INSTANCE(block_q8_0)
+GROUPED_GEMM_ESIMD_INSTANCE(block_q5_0)
 GROUPED_GEMM_ESIMD_INSTANCE(block_iq4_nl)
 GROUPED_GEMM_ESIMD_INSTANCE(block_iq4_xs)
 GROUPED_GEMM_ESIMD_INSTANCE(block_iq3_s)

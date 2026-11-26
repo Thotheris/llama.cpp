@@ -314,6 +314,42 @@ static void set_rows_sycl(
     );
 }
 
+// rows of float -> float/half with ne00 % 4 == 0 and aligned rows: one work-item per 4 values (one float4 load, one
+// 4-wide store) and the row indices from the range instead of 64-bit divisions per element; the same conversion
+template<typename TIdx, typename TOut>
+static bool set_rows_sycl_vec4(const char * src0_d, const TIdx * src1_d, char * dst_d,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t ne11, const int64_t ne12, const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3, queue_ptr stream) {
+    constexpr size_t ts = sizeof(TOut);
+    auto al = [](const void * p, size_t a) { return ((uintptr_t) p % a) == 0; };
+    if (ne00 % 4 != 0 || !al(src0_d, 16) || !al(dst_d, 4*ts) || nb01 % 16 || nb02 % 16 || nb03 % 16 ||
+        nb1 % (4*ts) || nb2 % (4*ts) || nb3 % (4*ts) || ne01 > 65535*256 || ne02*ne03 > INT32_MAX || ne00/4 > INT32_MAX) {
+        return false;
+    }
+    const int nu = (int) (ne00 / 4);
+    const int wg = std::min(256, (int) GGML_PAD(nu, WARP_SIZE));
+    const int n_ne02 = (int) ne02;
+    const sycl::range<3> grid(ne02*ne03, ne01, GGML_PAD(nu, wg));
+    stream->parallel_for(sycl::nd_range<3>(grid, sycl::range<3>(1, 1, wg)),
+        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int u = (int) it.get_global_id(2);
+            if (u >= nu) {
+                return;
+            }
+            const int     i23 = (int) it.get_global_id(0);
+            const int64_t i03 = i23 / n_ne02;
+            const int64_t i02 = i23 - i03*n_ne02;
+            const int64_t i01 = it.get_global_id(1);
+            const int64_t dst_row = *(const TIdx *) ((const char *) src1_d + i01*nb10 + (i02 % ne11)*nb11 + (i03 % ne12)*nb12);
+            const sycl::float4 v = ((const sycl::float4 *) (src0_d + i01*nb01 + i02*nb02 + i03*nb03))[u];
+            ((sycl::vec<TOut, 4> *) (dst_d + dst_row*nb1 + i02*nb2 + i03*nb3))[u] =
+                v.template convert<TOut, sycl::rounding_mode::automatic>();
+        });
+    return true;
+}
+
 template<typename TIn, typename TIdx>
 static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const char * src0_d = (const char *)src0->data;
@@ -322,6 +358,19 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
     GGML_TENSOR_BINARY_OP_LOCALS
 
     dpct::queue_ptr stream = ctx.stream();
+    if constexpr (std::is_same_v<TIn, float>) {
+        static const bool vec_off = getenv("GGML_SYCL_SET_ROWS_VEC") && atoi(getenv("GGML_SYCL_SET_ROWS_VEC")) == 0;
+        if (!vec_off && dst->type == GGML_TYPE_F16 &&
+            set_rows_sycl_vec4<TIdx, sycl::half>(src0_d, src1_d, (char *) dst->data, ne00, ne01, ne02, ne03, ne11, ne12,
+                                                 nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream)) {
+            return;
+        }
+        if (!vec_off && dst->type == GGML_TYPE_F32 &&
+            set_rows_sycl_vec4<TIdx, float>(src0_d, src1_d, (char *) dst->data, ne00, ne01, ne02, ne03, ne11, ne12,
+                                            nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream)) {
+            return;
+        }
+    }
     switch (dst->type) {
         case GGML_TYPE_F32:
             set_rows_sycl<TIn, TIdx, float>(

@@ -15,6 +15,8 @@
 #include <assert.h>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <map>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -64,12 +66,16 @@
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/dense-dnn.hpp"
+#include "ggml-sycl/gate-mix-mm.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/mem.hpp"
+#include "ggml-sycl/mmvq-id-multi.hpp"
+#include "ggml-sycl/mmv-f32.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
@@ -82,6 +88,11 @@
 #include "ggml-sycl/conv2d-dw.hpp"
 #include "ggml-sycl/conv2d-transpose.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
+#include "ggml-sycl/block-mix.hpp"
+#include "ggml-sycl/rel-bias.hpp"
+#include "ggml-sycl/fattn-dpas.hpp"
+#include "ggml-sycl/ssm-conv-hist.hpp"
+#include "ggml-sycl/route-fuse.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/ssm_scan.hpp"
 #include "ggml-sycl/fill.hpp"
@@ -121,6 +132,15 @@ int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
 int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
 int g_ggml_sycl_mmid_sched = GGML_SYCL_MMID_SCHED_DEVICE;
+// f32 weights times up to GGML_SYCL_MMV_F32_MAX_COLS columns take the small f32 GEMV (mmv-f32.cpp) instead of oneMKL
+int g_ggml_sycl_mmv_f32 = 1;
+
+// MUL_MAT_ID of 2..g_ggml_sycl_mmid_mc_max tokens takes the multi-column MoE GEMV (mmvq-id-multi.cpp), and of up to
+// g_ggml_sycl_mmid_mc_xmx_max tokens when its XMX variant takes the expert type; 0 or 1 disables either
+int g_ggml_sycl_mmid_mc_max     = 8;
+int g_ggml_sycl_mmid_mc_xmx_max = 16;
+// the multi-column MoE GEMV takes the XMX kernel for the types and shapes it covers
+int g_ggml_sycl_mmid_mc_xmx = 1;
 int g_ggml_sycl_dynamic_precision = GGML_SYCL_DYNAMIC_PRECISION_DEFAULT;
 int g_ggml_sycl_dynamic_required_precision = GGML_SYCL_DYNAMIC_PRECISION_F32;
 static const char * ggml_sycl_dynamic_precision_names[] = { "F16", "BF16", "TF32", "F32" };
@@ -437,6 +457,9 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
+#if GGML_SYCL_DNNL
+        ggml_sycl_dense_dnn_init_env();
+#endif
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
@@ -457,6 +480,10 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_graph_eviction_timeout = ggml_sycl_get_env("GGML_SYCL_GRAPH_EVICTION_TIMEOUT", 10);
         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
         g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", GGML_SYCL_MMID_SCHED_DEVICE) & 3;
+        g_ggml_sycl_mmid_mc_max = ggml_sycl_get_env("GGML_SYCL_MMID_MC_MAX", 8);
+        g_ggml_sycl_mmid_mc_xmx_max = ggml_sycl_get_env("GGML_SYCL_MMID_MC_XMX_MAX", 16);
+        g_ggml_sycl_mmid_mc_xmx = ggml_sycl_get_env("GGML_SYCL_MMID_MC_XMX", 1);
+        g_ggml_sycl_mmv_f32 = ggml_sycl_get_env("GGML_SYCL_MMV_F32", 1);
         g_ggml_sycl_xmx_gather_shapes = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_SHAPES", GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT);
         g_ggml_sycl_dynamic_precision =
             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
@@ -555,6 +582,8 @@ static void ggml_check_sycl() try {
 
 #if defined(GGML_SYCL_DNNL)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: %d\n", g_ggml_sycl_enable_dnn);
+        GGML_LOG_INFO("  GGML_SYCL_DENSE_DNN: %d (from %d columns, %s, budget %d MB)\n", g_ggml_sycl_dense_dnn,
+                      g_ggml_sycl_dense_dnn_min_cols, g_ggml_sycl_dense_dnn_bf16 ? "bf16" : "f16", g_ggml_sycl_dense_dnn_max_mb);
         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: DNN disabled by compile flag\n");
@@ -582,6 +611,10 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_OPT: %d\n", g_ggml_sycl_enable_optimize);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_TYPES: %d\n", g_ggml_sycl_xmx_gather_types);
         GGML_LOG_INFO("  GGML_SYCL_MMID_SCHED: %d\n", g_ggml_sycl_mmid_sched);
+        GGML_LOG_INFO("  GGML_SYCL_MMID_MC_MAX: %d\n", g_ggml_sycl_mmid_mc_max);
+        GGML_LOG_INFO("  GGML_SYCL_MMID_MC_XMX_MAX: %d\n", g_ggml_sycl_mmid_mc_xmx_max);
+        GGML_LOG_INFO("  GGML_SYCL_MMID_MC_XMX: %d\n", g_ggml_sycl_mmid_mc_xmx);
+        GGML_LOG_INFO("  GGML_SYCL_MMV_F32: %d\n", g_ggml_sycl_mmv_f32);
         GGML_LOG_INFO("  GGML_SYCL_MMID_ESIMD: %d\n", g_ggml_sycl_mmid_esimd);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_SHAPES: %d\n", g_ggml_sycl_xmx_gather_shapes);
         GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_PRECISION: %s\n",
@@ -795,6 +828,10 @@ static void
 ggml_backend_sycl_buffer_free_buffer(ggml_backend_buffer_t buffer) try {
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_set_device(ctx->device);
+#if GGML_SYCL_DNNL
+    ggml_sycl_dense_dnn_drop_buffer(buffer);
+#endif
+    ggml_sycl_gate_mix_mm_drop_buffer(buffer);
 
     delete ctx;
 }
@@ -2598,6 +2635,33 @@ static void scale_f32_sycl(const float *x, float *dst, const float scale, const 
 
 static void sum_rows_f32_sycl(const float *x, float *dst, const int ncols,
                               const int nrows, queue_ptr stream) {
+    if (ncols <= WARP_SIZE && nrows >= 64) {
+        // short rows (the 4-tap windows of a convolution, the 8 expert weights of a token): one work-item per row
+        // instead of a sub-group, the sum the tree of the sub-group reduction below (lane i holds x[i], the
+        // lanes past the row 0, halves added from WARP_SIZE/2 down), so the bits are the same
+        constexpr int wg = 256;
+        stream->parallel_for(sycl::nd_range<1>(GGML_PAD((size_t) nrows, wg), wg), [=](sycl::nd_item<1> it) {
+            const int row = (int) it.get_global_id(0);
+            if (row >= nrows) {
+                return;
+            }
+            const float * xr = x + (int64_t) row*ncols;
+            float v[WARP_SIZE];
+#pragma unroll
+            for (int i = 0; i < WARP_SIZE; ++i) {
+                v[i] = i < ncols ? xr[i] : 0.0f;
+            }
+#pragma unroll
+            for (int s = WARP_SIZE/2; s > 0; s >>= 1) {
+#pragma unroll
+                for (int i = 0; i < s; ++i) {
+                    v[i] = v[i] + v[i + s];
+                }
+            }
+            dst[row] = v[0];
+        });
+        return;
+    }
     const sycl::range<3> block_dims(1, 1, WARP_SIZE);
     const sycl::range<3> block_nums(1, nrows, 1);
     stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
@@ -2706,9 +2770,91 @@ static void copy_argsort_indices_unpadded(const int *              idx_padded,
     dst[(size_t) row * (size_t) ncols + (size_t) col] = idx_padded[(size_t) row * (size_t) ncols_pad + (size_t) col];
 }
 
+// the bitonic network of k_argsort_f32_i32 run by one sub-group per row: position p = 32 e + lane is element e of
+// the lane, partners at distance j < 32 are exchanged by shuffles, the others are registers of the same lane. The
+// compare-and-swap of every pair is the one of k_argsort_f32_i32, so the result is the same, ties included.
+// The steps (k, j) are template arguments, so the element indices are constants and the arrays stay in registers.
+template <ggml_sort_order order>
+static inline bool argsort_sg_swap(float va, int ia, float vb, int ib, bool up, int ncols) {
+    // true when the element at the lower position (a) and the one at the higher (b) swap
+    if (up) {
+        return ia >= ncols || (ib < ncols && (order == GGML_SORT_ORDER_ASC ? va > vb : va < vb));
+    }
+    return ib >= ncols || (ia < ncols && (order == GGML_SORT_ORDER_ASC ? va < vb : va > vb));
+}
+
+// one element per work-item, NP work-items in sub-groups of 32: partners within the sub-group by shuffles, the
+// others (J >= 32) through SLM, double-buffered so that each such step needs one barrier
+template <int NP, ggml_sort_order order, int K, int J>
+static inline void argsort_wg_step(float & v, int & id, int p, int ncols, const sycl::nd_item<1> & it,
+                                   float * sv, int * si, int buf) {
+    const bool is_lo = (p & J) == 0;
+    float      ov;
+    int        oi;
+    if constexpr (J >= 32) {
+        sv[buf * NP + p] = v;
+        si[buf * NP + p] = id;
+        it.barrier(sycl::access::fence_space::local_space);
+        ov = sv[buf * NP + (p ^ J)];
+        oi = si[buf * NP + (p ^ J)];
+        buf ^= 1;
+    } else {
+        ov = sycl::permute_group_by_xor(it.get_sub_group(), v, J);
+        oi = sycl::permute_group_by_xor(it.get_sub_group(), id, J);
+    }
+    const bool up = ((p & ~J) & K) == 0;
+    const bool sw = is_lo ? argsort_sg_swap<order>(v, id, ov, oi, up, ncols) : argsort_sg_swap<order>(ov, oi, v, id, up, ncols);
+    v  = sw ? ov : v;
+    id = sw ? oi : id;
+    if constexpr (J > 1) {
+        argsort_wg_step<NP, order, K, J / 2>(v, id, p, ncols, it, sv, si, buf);
+    } else if constexpr (K < NP) {
+        argsort_wg_step<NP, order, 2 * K, K>(v, id, p, ncols, it, sv, si, buf);
+    }
+}
+
+template <int NP>
+static void argsort_f32_i32_sg_sycl(const float * x, int * dst, const int ncols, const int nrows,
+                                    ggml_sort_order order, queue_ptr stream) {
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sv(sycl::range<1>(2 * NP), cgh);
+        sycl::local_accessor<int, 1>   si(sycl::range<1>(2 * NP), cgh);
+        const sycl::nd_range<1>        ndr(sycl::range<1>((size_t) nrows * NP), sycl::range<1>(NP));
+        auto kern = [=](sycl::nd_item<1> it, auto ord) {
+            constexpr ggml_sort_order o = decltype(ord)::value;
+            const int     p   = it.get_local_id(0);
+            const int64_t row = it.get_group(0);
+            float         v   = p < ncols ? x[row * ncols + p] : 0.0f;
+            int           id  = p;
+            argsort_wg_step<NP, o, 2, 1>(v, id, p, ncols, it, &sv[0], &si[0], 0);
+            if (p < ncols) {
+                dst[row * ncols + p] = id;
+            }
+        };
+        if (order == GGML_SORT_ORDER_ASC) {
+            cgh.parallel_for(ndr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                kern(it, std::integral_constant<ggml_sort_order, GGML_SORT_ORDER_ASC>{});
+            });
+        } else {
+            cgh.parallel_for(ndr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                kern(it, std::integral_constant<ggml_sort_order, GGML_SORT_ORDER_DESC>{});
+            });
+        }
+    });
+}
+
 static void argsort_f32_i32_sycl(const float *x, int *dst, const int ncols,
                                  const int nrows, ggml_sort_order order,
                                  queue_ptr stream, int device, ggml_sycl_pool & pool) {
+    // rows of 33 .. 256 columns (the MoE routers): the same network in one sub-group per row, no barriers
+    if ((order == GGML_SORT_ORDER_ASC || order == GGML_SORT_ORDER_DESC) && ncols > 32 && ncols <= 256) {
+        switch (next_power_of_2(ncols)) {
+            case 64:  argsort_f32_i32_sg_sycl<64>(x, dst, ncols, nrows, order, stream); return;
+            case 128: argsort_f32_i32_sg_sycl<128>(x, dst, ncols, nrows, order, stream); return;
+            case 256: argsort_f32_i32_sg_sycl<256>(x, dst, ncols, nrows, order, stream); return;
+            default: break;
+        }
+    }
     // bitonic sort requires ncols to be power of 2
     const int ncols_pad = next_power_of_2(ncols);
     const size_t shared_mem = (size_t) ncols_pad * sizeof(int);
@@ -5052,6 +5198,156 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     }
 }
 
+// A view of a 2D weight that has the reorder (SoA) layout: the view has no extra of its own, so every kernel would
+// read the planar bytes at its offset as the standard block layout (the Inkling2 attn_in row views past 128 tokens
+// after a decode step reordered the stacked weight: NaN logits). reorder_qw_planar packs the head field of every
+// block of the whole tensor first and the remaining fields after it, so a row range is not contiguous in that
+// layout. The rows of such a view are rebuilt here in the standard layout, in a pool buffer.
+template <typename block_t, typename tail_fn_t>
+static void unreorder_blocks_planar(const uint8_t * parent, int64_t nblocks, int64_t b0, int64_t n, block_t * out,
+                                    size_t head_offset, size_t head_bytes, tail_fn_t read_tail, dpct::queue_ptr stream) {
+    const uint8_t * tail = parent + head_bytes * nblocks;
+    stream->parallel_for(n, [=](auto i) {
+        const int64_t ib = b0 + (int64_t) i;
+        block_t & x = out[(int64_t) i];
+        uint8_t * dst_head = (uint8_t *) &x + head_offset;
+        for (size_t j = 0; j < head_bytes; ++j) {
+            dst_head[j] = parent[ib * head_bytes + j];
+        }
+        read_tail(x, ib, tail, nblocks);
+    });
+}
+
+static bool unreorder_blocks(ggml_type type, const uint8_t * parent, size_t parent_bytes, int64_t b0, int64_t n,
+                             void * out, dpct::queue_ptr stream) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+            unreorder_blocks_planar<block_q4_0>(parent, parent_bytes / sizeof(block_q4_0), b0, n, (block_q4_0 *) out,
+                offsetof(block_q4_0, qs), QK4_0 / 2,
+                [](block_q4_0 & x, int64_t ib, const uint8_t * tail, int64_t) { x.d = ((const sycl::half *) tail)[ib]; },
+                stream);
+            return true;
+        case GGML_TYPE_Q8_0:
+            unreorder_blocks_planar<block_q8_0>(parent, parent_bytes / sizeof(block_q8_0), b0, n, (block_q8_0 *) out,
+                offsetof(block_q8_0, qs), QK8_0,
+                [](block_q8_0 & x, int64_t ib, const uint8_t * tail, int64_t) { x.d = ((const sycl::half *) tail)[ib]; },
+                stream);
+            return true;
+        case GGML_TYPE_Q2_K:
+            unreorder_blocks_planar<block_q2_K>(parent, parent_bytes / sizeof(block_q2_K), b0, n, (block_q2_K *) out,
+                offsetof(block_q2_K, qs), QK_K / 4,
+                [](block_q2_K & x, int64_t ib, const uint8_t * tail, int64_t nblocks) {
+                    const uint8_t * scales = tail;
+                    for (int j = 0; j < QK_K / 16; ++j) {
+                        x.scales[j] = scales[ib * (QK_K / 16) + j];
+                    }
+                    x.dm = ((const sycl::half2 *) (scales + (QK_K / 16) * nblocks))[ib];
+                }, stream);
+            return true;
+        case GGML_TYPE_Q3_K:
+            unreorder_blocks_planar<block_q3_K>(parent, parent_bytes / sizeof(block_q3_K), b0, n, (block_q3_K *) out,
+                offsetof(block_q3_K, qs), QK_K / 4,
+                [](block_q3_K & x, int64_t ib, const uint8_t * tail, int64_t nblocks) {
+                    const uint8_t * hmask  = tail;
+                    const uint8_t * scales = hmask + (QK_K / 8) * nblocks;
+                    for (int j = 0; j < QK_K / 8; ++j) {
+                        x.hmask[j] = hmask[ib * (QK_K / 8) + j];
+                    }
+                    for (int j = 0; j < 12; ++j) {
+                        x.scales[j] = scales[ib * 12 + j];
+                    }
+                    x.d = ((const sycl::half *) (scales + 12 * nblocks))[ib];
+                }, stream);
+            return true;
+        case GGML_TYPE_Q4_K:
+            unreorder_blocks_planar<block_q4_K>(parent, parent_bytes / sizeof(block_q4_K), b0, n, (block_q4_K *) out,
+                offsetof(block_q4_K, qs), QK_K / 2,
+                [](block_q4_K & x, int64_t ib, const uint8_t * tail, int64_t nblocks) {
+                    const uint8_t * scales = tail;
+                    for (int j = 0; j < K_SCALE_SIZE; ++j) {
+                        x.scales[j] = scales[ib * K_SCALE_SIZE + j];
+                    }
+                    x.dm = ((const sycl::half2 *) (scales + K_SCALE_SIZE * nblocks))[ib];
+                }, stream);
+            return true;
+        case GGML_TYPE_Q5_K:
+            unreorder_blocks_planar<block_q5_K>(parent, parent_bytes / sizeof(block_q5_K), b0, n, (block_q5_K *) out,
+                offsetof(block_q5_K, qs), QK_K / 2,
+                [](block_q5_K & x, int64_t ib, const uint8_t * tail, int64_t nblocks) {
+                    const uint8_t * qh     = tail;
+                    const uint8_t * scales = qh + (QK_K / 8) * nblocks;
+                    for (int j = 0; j < QK_K / 8; ++j) {
+                        x.qh[j] = qh[ib * (QK_K / 8) + j];
+                    }
+                    for (int j = 0; j < K_SCALE_SIZE; ++j) {
+                        x.scales[j] = scales[ib * K_SCALE_SIZE + j];
+                    }
+                    x.dm = ((const sycl::half2 *) (scales + K_SCALE_SIZE * nblocks))[ib];
+                }, stream);
+            return true;
+        case GGML_TYPE_Q6_K:
+            unreorder_blocks_planar<block_q6_K>(parent, parent_bytes / sizeof(block_q6_K), b0, n, (block_q6_K *) out,
+                offsetof(block_q6_K, ql), QK_K / 2,
+                [](block_q6_K & x, int64_t ib, const uint8_t * tail, int64_t nblocks) {
+                    const uint8_t * qh     = tail;
+                    const uint8_t * scales = qh + (QK_K / 4) * nblocks;
+                    for (int j = 0; j < QK_K / 4; ++j) {
+                        x.qh[j] = qh[ib * (QK_K / 4) + j];
+                    }
+                    for (int j = 0; j < QK_K / 16; ++j) {
+                        x.scales[j] = scales[ib * (QK_K / 16) + j];
+                    }
+                    x.d = ((const sycl::half *) (scales + (QK_K / 16) * nblocks))[ib];
+                }, stream);
+            return true;
+        case GGML_TYPE_IQ3_S:
+            unreorder_blocks_planar<block_iq3_s>(parent, parent_bytes / sizeof(block_iq3_s), b0, n, (block_iq3_s *) out,
+                offsetof(block_iq3_s, qs), QK_K / 4,
+                [](block_iq3_s & x, int64_t ib, const uint8_t * tail, int64_t nblocks) {
+                    const uint8_t * qh       = tail;
+                    const uint8_t * signs    = qh + (QK_K / 32) * nblocks;
+                    const uint8_t * metadata = signs + (QK_K / 8) * nblocks + ib * (sizeof(ggml_half) + IQ3S_N_SCALE);
+                    for (int j = 0; j < QK_K / 32; ++j) {
+                        x.qh[j] = qh[ib * (QK_K / 32) + j];
+                    }
+                    for (int j = 0; j < QK_K / 8; ++j) {
+                        x.signs[j] = signs[ib * (QK_K / 8) + j];
+                    }
+                    x.d = *reinterpret_cast<const ggml_half *>(metadata);
+                    for (int j = 0; j < IQ3S_N_SCALE; ++j) {
+                        x.scales[j] = metadata[sizeof(ggml_half) + j];
+                    }
+                }, stream);
+            return true;
+        case GGML_TYPE_IQ3_XXS:
+            unreorder_blocks_planar<block_iq3_xxs>(parent, parent_bytes / sizeof(block_iq3_xxs), b0, n,
+                (block_iq3_xxs *) out, offsetof(block_iq3_xxs, qs), 3 * QK_K / 8,
+                [](block_iq3_xxs & x, int64_t ib, const uint8_t * tail, int64_t) {
+                    x.d = reinterpret_cast<const ggml_half *>(tail)[ib];
+                }, stream);
+            return true;
+        default:
+            return false;
+    }
+}
+
+// the reordered 2D parent of a row-range view src0, else nullptr
+static const ggml_tensor * ggml_sycl_reordered_view_parent(const ggml_tensor * src0) {
+    const ggml_tensor * p = src0->view_src;
+    if (!p || (src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder)) {
+        return nullptr;
+    }
+    const auto * pex = (const ggml_tensor_extra_gpu *) p->extra;
+    if (!pex || !pex->optimized_feature.reorder) {
+        return nullptr;
+    }
+    // reorder_qw() reorders 3D tensors per expert, so only 2D parents have the whole-tensor planar layout
+    GGML_ASSERT(p->ne[2] == 1 && p->ne[3] == 1 && "view of a reordered 3D weight");
+    GGML_ASSERT(src0->type == p->type && src0->ne[0] == p->ne[0] && src0->nb[1] == p->nb[1] &&
+                ggml_is_contiguous(src0) && src0->view_offs % p->nb[1] == 0 && "non row-range view of a reordered weight");
+    return p;
+}
+
 static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
     return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
            ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
@@ -5169,6 +5465,36 @@ static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
 
+#if GGML_SYCL_DNNL
+    // a weight times a wide batch: oneDNN against a persistent f16 copy of the weight (dense-dnn.hpp). Taken before
+    // the row-view rebuild below: the weight copy is made from the whole reordered base, so a view needs no rebuild.
+    if (!ggml_backend_buffer_is_sycl_split(src0->buffer) && dst->src[0] == src0 && dst->src[1] == src1 &&
+        !(dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) &&
+        ggml_sycl_dense_dnn_eligible(ctx.device, dst) && ggml_sycl_dense_dnn_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+#endif
+
+    // a row view of a reordered weight: multiply a standard-layout copy of its rows (see unreorder_blocks)
+    ggml_sycl_pool_alloc<char> src0_std_alloc(ctx.pool());
+    ggml_tensor                src0_std;
+    if (const ggml_tensor * parent = ggml_sycl_reordered_view_parent(src0)) {
+        const size_t  bs = ggml_type_size(src0->type);
+        const int64_t b0 = (int64_t) (src0->view_offs / bs);
+        const int64_t n  = (int64_t) (ggml_nbytes(src0) / bs);
+        char * buf = src0_std_alloc.alloc(ggml_nbytes(src0));
+        if (!unreorder_blocks(src0->type, (const uint8_t *) parent->data, ggml_nbytes(parent), b0, n, buf, ctx.stream())) {
+            GGML_ABORT("%s: view %s of reordered weight %s: type %s not handled\n", __func__, src0->name, parent->name,
+                       ggml_type_name(src0->type));
+        }
+        src0_std           = *src0;
+        src0_std.data      = buf;
+        src0_std.view_src  = nullptr;
+        src0_std.view_offs = 0;
+        src0_std.extra     = nullptr;
+        src0               = &src0_std;
+    }
+
     // Handle HADAMARAD hint given from further up the pipeline and pass it to the correct
     // kernel.
     //
@@ -5233,7 +5559,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
     }
 
-    if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
+    if (g_ggml_sycl_mmv_f32 && !split && ggml_sycl_mmv_f32_eligible(src0, src1, dst)) {
+        ggml_sycl_mmv_f32(ctx, src0, src1, dst);
+    } else if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         // TODO: Refactor and cleanup of mul mat dispatching.
         if (src0->ne[3] == 1 && src1->ne[3] == 1) {
             // KQ single-batch
@@ -5390,6 +5718,10 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
     // this writes glu->data directly rather than the per-device row slices that
     // ggml_sycl_op_mul_mat() stitches back together, so it cannot serve split weights
     if (ggml_backend_buffer_is_sycl_split(wu->buffer) || ggml_backend_buffer_is_sycl_split(wg->buffer)) {
+        return false;
+    }
+    // the fused kernels read the weights in place: a row view of a reordered weight takes ggml_sycl_mul_mat()
+    if (ggml_sycl_reordered_view_parent(wu) || ggml_sycl_reordered_view_parent(wg)) {
         return false;
     }
 
@@ -5691,6 +6023,120 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         src1_row_stride, stream);
 }
 
+// the XMX variant of the multi-column MoE GEMV would take src0 in the layout opt_for_reorder_id() leaves it in
+static bool ggml_sycl_mmid_mc_xmx_expected(const ggml_tensor * src0) {
+    if (!g_ggml_sycl_mmid_mc_xmx) {
+        return false;
+    }
+    const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
+    const bool reorders  = g_ggml_sycl_enable_optimize &&
+                          (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_K ||
+                           src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K);
+    return ggml_sycl_mmid_mc_xmx_supported(src0->type, reordered || reorders, (int) src0->ne[0], src0->nb[2],
+                                           src0->data);
+}
+
+// true when ggml_sycl_mul_mat_id takes the multi-column MoE GEMV: 2..g_ggml_sycl_mmid_mc_max tokens (up to
+// g_ggml_sycl_mmid_mc_xmx_max for the XMX variant), a type mmvq-id-multi.cpp covers in either layout, and the
+// f32/i32 layout it reads
+static bool ggml_sycl_mul_mat_id_mc_eligible(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    const int64_t       ne12 = src1->ne[2];
+    if (ne12 < 2 || ne12 > std::max(g_ggml_sycl_mmid_mc_max, g_ggml_sycl_mmid_mc_xmx ? g_ggml_sycl_mmid_mc_xmx_max : 0)) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src0->ne[3] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || ggml_backend_buffer_is_sycl_split(src0->buffer) || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    if (src1->ne[0] != src0->ne[0] || src1->ne[0] % QK8_1 != 0 || dst->ne[0] != src0->ne[1] ||
+        dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const int64_t n_ids = ids->ne[0];
+    if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->ne[1] != ne12 || ids->ne[2] != 1) {
+        return false;
+    }
+    if (src1->ne[1] != 1 && src1->ne[1] != n_ids) {
+        return false;
+    }
+    if (src0->ne[2] > GGML_SYCL_MMID_MC_MAX_EXPERTS || n_ids * ne12 > GGML_SYCL_MMID_MC_MAX_ROUTES) {
+        return false;
+    }
+    // past g_ggml_sycl_mmid_mc_max tokens only the XMX variant is faster than the grouped GEMM
+    if (ne12 > g_ggml_sycl_mmid_mc_max && !ggml_sycl_mmid_mc_xmx_expected(src0)) {
+        return false;
+    }
+    // the reorderable types have a kernel in both layouts, the others are never reordered
+    return ggml_sycl_mmid_mc_supports_type(src0->type, false);
+}
+
+// the multi-column MoE GEMV of a MUL_MAT_ID that ggml_sycl_mul_mat_id_mc_eligible() accepts; false, with nothing
+// queued, when the layout src0 ends up in has no kernel. sched_ext: a schedule buffer of
+// ggml_sycl_mmid_mc_sched_ints() to use instead of a pool one, sched_ready: it holds the schedule of these ids.
+static bool ggml_sycl_mul_mat_id_mc(ggml_backend_sycl_context & ctx, ggml_tensor * dst, int32_t * sched_ext = nullptr,
+                                    bool sched_ready = false) {
+    if (!ggml_sycl_mul_mat_id_mc_eligible(dst)) {
+        return false;
+    }
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    opt_for_reorder_id(&ctx, src0);
+    const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
+    if (!ggml_sycl_mmid_mc_supports_type(src0->type, reordered)) {
+        return false;
+    }
+    const queue_ptr stream   = ctx.stream();
+    const int       ne10     = (int) src1->ne[0];
+    const int       ne11     = (int) src1->ne[1];
+    const int       ne12     = (int) src1->ne[2];
+    const int       n_ids    = (int) ids->ne[0];
+    const int       n_as     = (int) src0->ne[2];
+    const int       padded   = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t    row_q8   = (size_t) padded * sizeof(block_q8_1) / QK8_1;
+    const int       nrows_q8 = ne11 * ne12;
+
+    const int  n_routes = n_ids * ne12;
+    ggml_sycl_pool_alloc<int32_t> sched_pool(ctx.pool());
+    int32_t * sched = sched_ext ? sched_ext : sched_pool.alloc(ggml_sycl_mmid_mc_sched_ints(n_as, n_routes));
+    if (!sched_ext) {
+        sched_ready = false;
+    }
+
+    if (g_ggml_sycl_mmid_mc_xmx && ggml_sycl_xmx_enabled(ctx.device) && row_q8 % 64 == 0 &&
+        ggml_sycl_mmid_mc_xmx_supported(src0->type, reordered, ne10, src0->nb[2], src0->data)) {
+        ggml_sycl_pool_alloc<char> packed(ctx.pool(), (size_t) n_routes * row_q8);
+        if ((uintptr_t) packed.get() % 64 == 0) {
+            ggml_sycl_mmid_mc_xmx(src0->type, src0->data, src0->nb[2], ne10, (int) src0->ne[1],
+                                  (const char *) src1->data, src1->nb[1], src1->nb[2], ne11, packed.get(), row_q8,
+                                  (const int32_t *) ids->data, ids->nb[1], n_ids, ne12, n_as, (float *) dst->data,
+                                  dst->nb[1], dst->nb[2], sched, sched_ready, stream);
+            return true;
+        }
+    }
+    if (ne12 > g_ggml_sycl_mmid_mc_max) {
+        return false;  // the grouped GEMM is faster than the DP4A kernels here
+    }
+
+    ggml_sycl_pool_alloc<char> src1_q8(ctx.pool(), (size_t) nrows_q8 * row_q8);
+    if (reordered) {
+        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) src1->data, src1_q8.get(), ne10,
+                                                               nrows_q8, padded, stream);
+    } else {
+        quantize_row_q8_1_sycl<quantize_q8_1>((const float *) src1->data, src1_q8.get(), ne10, nrows_q8, padded,
+                                              stream);
+    }
+    ggml_sycl_mmid_mc(src0->type, reordered, src0->data, src0->nb[2], (int) src0->ne[0], (int) src0->ne[1],
+                      src1_q8.get(), row_q8, ne11, (const int32_t *) ids->data, ids->nb[1], n_ids, ne12, n_as,
+                      (float *) dst->data, dst->nb[1], dst->nb[2], sched, sched_ready, stream);
+    return true;
+}
+
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
 // builds a projection of a memory layout where each expert's slice is contiguous
 static void mmid_counting_sort_rows(
@@ -5756,6 +6202,135 @@ static bool ggml_sycl_mul_mat_id_device_sched_eligible(const ggml_tensor * dst) 
            src1->nb[1] == sizeof(float)*src1->ne[0] && dst->nb[1] == sizeof(float)*dst->ne[0];
 }
 
+// The device-scheduled grouped GEMM of a MUL_MAT_ID that ggml_sycl_mul_mat_id_device_sched_eligible() accepts.
+// situ: dst->src[1] is the output of that GLU_OP_SITU node, which was not run; the pack reads its sources and
+// applies it instead. sched: a schedule to build or reuse, see ggml_sycl_mmid_sched. epi: the SiTU epilogue to
+// try, for the next projection run with combination epi_combo (see ggml_sycl_moe_block_fused). Returns false
+// before queuing work when the grouped GEMM does not take the case.
+// comb_w: the router weights [1, n_used, n_tokens] of the MoE combine that follows (ggml_sycl_moe_block_fused): dst
+// is then written as weighted half rows [n_tokens][ne1][ne0] for ggml_sycl_moe_combine_half(), not as f32.
+static bool ggml_sycl_mul_mat_id_device(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                                        const ggml_tensor * situ, ggml_sycl_mmid_sched * sched = nullptr,
+                                        const ggml_sycl_grouped_gemm_situ_out * epi = nullptr, int epi_combo = -1,
+                                        const ggml_tensor * comb_w = nullptr) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const queue_ptr stream = ctx.stream();
+    const int64_t   n_as   = ne02;
+    const int64_t   n_ids  = ids->ne[0];
+
+    if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
+        ggml_sycl_xmx_gather_type_enabled(src0->type)) {
+        opt_for_reorder_id(&ctx, src0);
+    }
+    const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
+    ggml_sycl_grouped_gemm_rows src1_rows = { (char *) src1->data, nullptr, ne11, nb11, nb12 };
+#if GGML_SYCL_DNNL
+    // dense rows of a producer that wrote their f16 copy for a dense matmul (the router): the same half rows
+    if (!situ && nb11 == ne10*sizeof(float) && nb12 == ne11*nb11) {
+        src1_rows.h = ggml_sycl_dense_dnn_act_lookup(ctx, src1->data, ne10, ne11*ne12, ne10);
+    }
+#endif
+    ggml_sycl_grouped_gemm_situ situ_params = {};
+    if (situ) {
+        // x and g rows of the SiTU sources at the routed (slot, token), see ggml_sycl_mul_mat_id_situ_fused()
+        const ggml_tensor * sx = situ->src[0];
+        const ggml_tensor * sg = situ->src[1];
+        const size_t        ts = sizeof(float);
+        char *              x  = (char *) sx->data;
+        char *              g  = (char *) (sg ? sg->data : sx->data);
+        if (!sg) {
+            const bool swapped = ggml_get_op_params_i32(situ, 1) != 0;
+            x += swapped ? ne10 * ts : 0;
+            g += swapped ? 0 : ne10 * ts;
+        }
+        src1_rows             = { x, nullptr, ne11, sx->nb[1], sx->nb[2] };
+        situ_params.g_off     = g - x;
+        situ_params.beta      = ggml_get_op_params_f32(situ, 2);
+        situ_params.lb        = ggml_get_op_params_f32(situ, 3);
+    }
+    ggml_sycl_grouped_gemm_rows dst_rows = { (char *) dst->data, nullptr, ne1, nb1, nb2 };
+    const size_t hnb1 = ne0 * sizeof(sycl::half), hnb2 = ne1 * hnb1;
+    if (comb_w) {
+        dst_rows.nb1   = hnb1;
+        dst_rows.nb2   = hnb2;
+        dst_rows.w     = (const char *) comb_w->data;
+        dst_rows.w_nb1 = comb_w->nb[1];
+        dst_rows.w_nb2 = comb_w->nb[2];
+    }
+    if (!ggml_sycl_grouped_dequant_gemm_device(src0->type, reordered, src0->data, nb02, src1_rows,
+            ggml_sycl_src1_prec(dst), dst_rows, (const int32_t *) ids->data, ids->nb[1], n_as, n_ids,
+            ids->ne[1], ne01, ne10, ctx.pool(), stream, situ ? &situ_params : nullptr, sched, epi, epi_combo)) {
+        return false;
+    }
+    // the device schedule drops skipped slots (id == -1), so their dst rows are zeroed here: a work-item a
+    // route (the grouped GEMM bounds them to INT32_MAX), which writes only where its slot is skipped
+    const char *  ids_data = (const char *) ids->data;
+    const size_t  ids_nb1  = ids->nb[1];
+    char *        dst_data = (char *) dst->data;
+    const int32_t nids     = (int32_t) n_ids;
+    const int32_t n_routes = (int32_t) (n_ids * ids->ne[1]);
+    constexpr int nth      = 256;
+    if (comb_w) {
+        // the half rows of the combine
+        stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(((size_t) n_routes + nth - 1) / nth * nth), sycl::range<1>(nth)),
+            [=](sycl::nd_item<1> item) {
+                const int32_t r = (int32_t) item.get_global_id(0);
+                if (r >= n_routes) {
+                    return;
+                }
+                const int64_t iid1 = r / nids;
+                const int64_t id   = r % nids;
+                if (*(const int32_t *) (ids_data + iid1*ids_nb1 + id*sizeof(int32_t)) != -1) {
+                    return;
+                }
+                sycl::half * row = (sycl::half *) (dst_data + id*hnb1 + iid1*hnb2);
+                for (int64_t j = 0; j < ne0; ++j) {
+                    row[j] = 0.0f;
+                }
+            });
+        return true;
+    }
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(((size_t) n_routes + nth - 1) / nth * nth), sycl::range<1>(nth)),
+        [=](sycl::nd_item<1> item) {
+            const int32_t r = (int32_t) item.get_global_id(0);
+            if (r >= n_routes) {
+                return;
+            }
+            const int64_t iid1 = r / nids;
+            const int64_t id   = r % nids;
+            if (*(const int32_t *) (ids_data + iid1*ids_nb1 + id*sizeof(int32_t)) != -1) {
+                return;
+            }
+            float * row = (float *) (dst_data + id*nb1 + iid1*nb2);
+            for (int64_t j = 0; j < ne0; ++j) {
+                row[j] = 0.0f;
+            }
+        });
+    return true;
+}
+
+// the grouped GEMM combination ggml_sycl_mul_mat_id_device would run dst with, -1 when it would not take it
+static int ggml_sycl_mul_mat_id_device_combo(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    ggml_tensor *       src0 = dst->src[0];
+    const ggml_tensor * ids  = dst->src[2];
+    if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
+        ggml_sycl_xmx_gather_type_enabled(src0->type)) {
+        opt_for_reorder_id(&ctx, src0);
+    }
+    const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
+    if (dst->src[1]->ne[1] <= 0 || dst->ne[1] <= 0) {
+        return -1;
+    }
+    return ggml_sycl_grouped_dequant_gemm_device_combo(src0->type, reordered, ggml_sycl_src1_prec(dst), src0->ne[2],
+                                                       ids->ne[0], ids->ne[1], src0->ne[1], src0->ne[0], ctx.stream());
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
@@ -5778,42 +6353,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     }
     GGML_ASSERT(!ggml_sycl_mul_mat_id_should_use_mmvq(dst));
 
+    if (ggml_sycl_mul_mat_id_mc(ctx, dst)) {
+        return;
+    }
+
     // The per-expert loop below reads the experts in whatever layout they have: reorder MXFP4 here as well, so prompt processing does not depend on a single-token decode having run first.
     if (src0->type == GGML_TYPE_MXFP4) {
         opt_for_reorder_id(&ctx, src0);
     }
 
-    if (ggml_sycl_mul_mat_id_device_sched_eligible(dst)) {
-        if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
-            ggml_sycl_xmx_gather_type_enabled(src0->type)) {
-            opt_for_reorder_id(&ctx, src0);
-        }
-        const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
-        const ggml_sycl_grouped_gemm_rows src1_rows = { (char *) src1->data, nullptr, ne11, nb11, nb12 };
-        const ggml_sycl_grouped_gemm_rows dst_rows = { (char *) dst->data, nullptr, ne1, nb1, nb2 };
-        if (ggml_sycl_grouped_dequant_gemm_device(src0->type, reordered, src0->data, nb02, src1_rows,
-                ggml_sycl_src1_prec(dst), dst_rows, (const int32_t *) ids->data, ids->nb[1], n_as, n_ids,
-                ids->ne[1], ne01, ne10, ctx.pool(), stream)) {
-            // the device schedule drops skipped slots (id == -1), so their dst rows are zeroed here
-            const char * ids_data = (const char *) ids->data;
-            const size_t ids_nb1  = ids->nb[1];
-            char *       dst_data = (char *) dst->data;
-            const int    nth      = (int) std::min<int64_t>(ne0, 256);
-            stream->parallel_for(
-                sycl::nd_range<2>(sycl::range<2>(ids->ne[1], n_ids * nth), sycl::range<2>(1, nth)),
-                [=](sycl::nd_item<2> item) {
-                    const int64_t iid1 = item.get_group(0);
-                    const int64_t id   = item.get_group(1);
-                    if (*(const int32_t *) (ids_data + iid1*ids_nb1 + id*sizeof(int32_t)) != -1) {
-                        return;
-                    }
-                    float * row = (float *) (dst_data + id*nb1 + iid1*nb2);
-                    for (int64_t j = item.get_local_id(1); j < ne0; j += nth) {
-                        row[j] = 0.0f;
-                    }
-                });
-            return;
-        }
+    if (ggml_sycl_mul_mat_id_device_sched_eligible(dst) && ggml_sycl_mul_mat_id_device(ctx, dst, nullptr)) {
+        return;
     }
 
     std::vector<char> ids_host(ggml_nbytes(ids));
@@ -6284,6 +6834,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                 case GGML_GLU_OP_GEGLU_QUICK:
                     ggml_sycl_geglu_quick(ctx, dst);
                     break;
+                case GGML_GLU_OP_SITU:
+                    ggml_sycl_situ(ctx, dst);
+                    break;
                 default:
                     return false;
             }
@@ -6317,6 +6870,15 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             break;
         case GGML_OP_L2_NORM:
             ggml_sycl_l2_norm(ctx, dst);
+            break;
+        case GGML_OP_L2_CLIP:
+            ggml_sycl_l2_clip(ctx, dst);
+            break;
+        case GGML_OP_GATE_MIX:
+            ggml_sycl_gate_mix(ctx, dst);
+            break;
+        case GGML_OP_GATE_MIX_MV:
+            ggml_sycl_gate_mix_mv(ctx, dst);
             break;
         case GGML_OP_MUL_MAT:
             if (dst->src[0]->ne[3] != dst->src[1]->ne[3]) {
@@ -6439,6 +7001,15 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             break;
         case GGML_OP_SSM_CONV:
             ggml_sycl_ssm_conv(ctx, dst);
+            break;
+        case GGML_OP_SSM_CONV_HIST:
+            ggml_sycl_ssm_conv_hist(ctx, dst);
+            break;
+        case GGML_OP_BLOCK_MIX:
+            ggml_sycl_block_mix(ctx, dst);
+            break;
+        case GGML_OP_REL_BIAS:
+            ggml_sycl_rel_bias(ctx, dst);
             break;
         case GGML_OP_SSM_SCAN:
             ggml_sycl_ssm_scan(ctx, dst);
@@ -6700,14 +7271,1002 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// t, not a graph output, is read (directly or through views) by no node after node `last`
+static bool ggml_sycl_read_only_by(const ggml_cgraph * cgraph, const ggml_tensor * t, int last) {
+    if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    for (int i = last + 1; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n == t || n->view_src == t) {
+            return false;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * src = n->src[k];
+            if (src && (src == t || src->view_src == t)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Row-exact verify (GGML_SYCL_ROW_EXACT=1, the default): in a graph whose flash attention is row-exact
+// (ggml_flash_attn_ext_set_row_exact, a speculative verify: every row an output in a context that can roll back) the
+// quantized weight products of 2..GGML_SYCL_ROW_EXACT_MAX (8) columns run each column with the kernel a one-token
+// decode uses, and an attention of more than 4 query rows runs as 4-row slices on the decode kernel
+// (ggml_sycl_row_exact_node), so every row is bit-identical to the decode of its token alone and a speculative decode
+// accepts the tokens the decode without speculation gives. GGML_SYCL_ROW_EXACT=0: the batched kernels (their
+// q8_1 rounding of the activations differs from the f32 one of the one-column DMMV, and the MoE GEMM and the
+// attention of 5+ rows round differently from the one-token kernels).
+static bool g_ggml_sycl_row_exact = false; // the graph being computed is a row-exact one
+
+static bool ggml_sycl_row_exact_graph(const ggml_cgraph * cgraph) {
+    // 2: every graph (a diagnostic for tools that compute the nodes one by one, without the attention in the graph)
+    static const int env = ggml_sycl_get_env("GGML_SYCL_ROW_EXACT", 1);
+    if (env != 1) {
+        return env == 2;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_FLASH_ATTN_EXT) {
+            return ggml_get_op_params_i32(n, 6) != 0;
+        }
+    }
+    return false;
+}
+
+static int ggml_sycl_row_exact_max() {
+    static const int n = ggml_sycl_get_env("GGML_SYCL_ROW_EXACT_MAX", 8);
+    return n;
+}
+
+// GLU_OP_SITU at node_idx whose only reader is the next node, a device-scheduled MUL_MAT_ID taking it as src1
+// (the MoE down projection after the gate_up one), in a form the down pack can apply it in: the pack then
+// gathers the gate_up rows and applies the SiTU, so its output is never written.
+static bool ggml_sycl_situ_mmid_fusable(const ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion || node_idx + 1 >= cgraph->n_nodes || g_ggml_sycl_row_exact) {
+        return false;
+    }
+    const ggml_tensor * situ = cgraph->nodes[node_idx];
+    const ggml_tensor * mmid = cgraph->nodes[node_idx + 1];
+    if (situ->op != GGML_OP_GLU || ggml_get_glu_op(situ) != GGML_GLU_OP_SITU || mmid->op != GGML_OP_MUL_MAT_ID ||
+        (mmid->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || mmid->src[1] != situ || mmid->src[0] == situ ||
+        mmid->src[2] == situ || !ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+        return false;
+    }
+    const ggml_tensor * sx = situ->src[0];
+    const ggml_tensor * sg = situ->src[1];
+    // the pack addresses x and g of a routed row with the strides of x, and the SiTU output with those of a
+    // contiguous f32 tensor of the same shape
+    return situ->type == GGML_TYPE_F32 && ggml_sycl_situ_supported(situ) && ggml_is_contiguous(situ) &&
+           situ->ne[3] == 1 && sx->ne[3] == 1 && !ggml_backend_buffer_is_sycl_split(mmid->src[0]->buffer) &&
+           (!sg || (sg->nb[1] == sx->nb[1] && sg->nb[2] == sx->nb[2] && sg->ne[0] == situ->ne[0] &&
+                    sx->ne[0] == situ->ne[0])) &&
+           (sg || sx->ne[0] == 2 * situ->ne[0]) && sx->ne[1] == situ->ne[1] && sx->ne[2] == situ->ne[2] &&
+           mmid->src[1]->ne[2] != 1 && mmid->src[0]->ne[3] == mmid->src[1]->ne[3] &&
+           ggml_sycl_mul_mat_id_device_sched_eligible(mmid) && !ggml_sycl_mul_mat_id_mc_eligible(mmid);
+}
+
+// The MoE combine after the down MUL_MAT_ID at node_idx: the index of an OUT_PROD of that output and the router
+// weights (out[e, 0, t] = sum_k down[e, k, t] * w[0, k, t], see build_moe_ffn), past view nodes only, which
+// nothing but it reads; -1 when there is none or it is not the f32 contiguous form the half combine takes
+// (GGML_SYCL_MOE_COMBINE=0: never).
+static int ggml_sycl_moe_combine_node(const ggml_cgraph * cgraph, int node_idx) {
+    static const bool env = ggml_sycl_get_env("GGML_SYCL_MOE_COMBINE", 1) != 0;
+    const ggml_tensor * down = cgraph->nodes[node_idx];
+    int                 k    = node_idx + 1;
+    while (k < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[k]) && cgraph->nodes[k]->view_src != down) {
+        ++k;
+    }
+    if (!env || k >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * op = cgraph->nodes[k];
+    const ggml_tensor * w  = op->src[1];
+    if (op->op != GGML_OP_OUT_PROD || op->src[0] != down || (op->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        down->type != GGML_TYPE_F32 || !ggml_is_contiguous(down) || down->ne[3] != 1 ||
+        w->type != GGML_TYPE_F32 || w->ne[0] != 1 || w->ne[1] != down->ne[1] || w->ne[2] != down->ne[2] ||
+        w->ne[3] != 1 || w->nb[1] % sizeof(float) != 0 || w->nb[2] % sizeof(float) != 0 ||
+        op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || op->ne[0] != down->ne[0] || op->ne[1] != 1 ||
+        op->ne[2] != down->ne[2] || op->ne[3] != 1 || down->ne[0] % 8 != 0 ||
+        ggml_nbytes(w) > UINT32_MAX || !ggml_sycl_read_only_by(cgraph, down, k)) {
+        return -1;
+    }
+    return k;
+}
+
+// SiTU + down MUL_MAT_ID as above; false, with nothing queued, when the pair does not qualify
+static bool ggml_sycl_mul_mat_id_situ_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    return ggml_sycl_situ_mmid_fusable(cgraph, node_idx) &&
+           ggml_sycl_mul_mat_id_device(ctx, cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx]);
+}
+
+// The MoE expert block at a few tokens (ggml_sycl_mul_mat_id_mc_eligible): gate_up MUL_MAT_ID, views, SiTU, down
+// MUL_MAT_ID with the same ids, the two multi-column GEMVs sharing one schedule. Returns the nodes to skip, 0 with
+// nothing queued when the block does not qualify.
+static int ggml_sycl_moe_block_mc(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * gate_up = cgraph->nodes[node_idx];
+    int           j       = node_idx + 1;
+    while (j < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[j])) {
+        ++j;
+    }
+    if (j + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * situ = cgraph->nodes[j];
+    ggml_tensor * down = cgraph->nodes[j + 1];
+    if (situ->op != GGML_OP_GLU || ggml_get_glu_op(situ) != GGML_GLU_OP_SITU || down->op != GGML_OP_MUL_MAT_ID ||
+        (down->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (situ->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        down->src[1] != situ || down->src[2] != gate_up->src[2] || down->src[0]->ne[2] != gate_up->src[0]->ne[2] ||
+        !ggml_sycl_mul_mat_id_mc_eligible(down)) {
+        return 0;
+    }
+    const ggml_tensor *           ids = gate_up->src[2];
+    ggml_sycl_pool_alloc<int32_t> sched(
+        ctx.pool(), ggml_sycl_mmid_mc_sched_ints((int) gate_up->src[0]->ne[2], (int) (ids->ne[0] * ids->ne[1])));
+    if (!ggml_sycl_mul_mat_id_mc(ctx, gate_up, sched.get(), false)) {
+        return 0;
+    }
+    ggml_sycl_situ(ctx, situ);
+    if (!ggml_sycl_mul_mat_id_mc(ctx, down, sched.get(), true)) {
+        ggml_sycl_mul_mat_id(ctx, down);
+    }
+    return j + 1 - node_idx;
+}
+
+// The MoE expert block, gate_up MUL_MAT_ID, views, SiTU, down MUL_MAT_ID with the same ids: one device
+// schedule serves both projections, and the SiTU goes into the down pack. Returns the nodes to skip, 0 with
+// nothing queued when the block does not qualify.
+static int ggml_sycl_moe_block_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * gate_up = cgraph->nodes[node_idx];
+    if (!g_ggml_sycl_enable_fusion || gate_up->op != GGML_OP_MUL_MAT_ID || gate_up->src[1]->ne[2] == 1 ||
+        gate_up->src[0]->ne[3] != gate_up->src[1]->ne[3] ||
+        ggml_backend_buffer_is_sycl_split(gate_up->src[0]->buffer)) {
+        return 0;
+    }
+    if (ggml_sycl_mul_mat_id_mc_eligible(gate_up)) {
+        const int n = ggml_sycl_moe_block_mc(ctx, cgraph, node_idx);
+        if (n > 0) {
+            return n;
+        }
+    }
+    if (!ggml_sycl_mul_mat_id_device_sched_eligible(gate_up)) {
+        return 0;
+    }
+    int j = node_idx + 1;
+    while (j < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[j])) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes || !ggml_sycl_situ_mmid_fusable(cgraph, j)) {
+        return 0;
+    }
+    ggml_tensor * situ = cgraph->nodes[j];
+    ggml_tensor * down = cgraph->nodes[j + 1];
+    if (down->src[2] != gate_up->src[2] || down->src[0]->ne[2] != gate_up->src[0]->ne[2]) {
+        return 0;
+    }
+    // The SiTU in the gate_up epilogue, which packs the down B and does not write the gate_up output: its x
+    // and g are row ranges of that output, which nothing but the block reads (GGML_SYCL_MOE_EPI=0: off)
+    static const bool epi_env = ggml_sycl_get_env("GGML_SYCL_MOE_EPI", 1) != 0;
+    ggml_sycl_grouped_gemm_situ_out epi       = {};
+    int                             epi_combo = -1;
+    if (epi_env && ggml_sycl_read_only_by(cgraph, gate_up, j)) {
+        const ggml_tensor * sx = situ->src[0];
+        const ggml_tensor * sg = situ->src[1];
+        const int64_t       D  = situ->ne[0];
+        const int64_t       ts = sizeof(float);
+        int64_t             xo = (const char *) sx->data - (const char *) gate_up->data;
+        int64_t             go = (const char *) (sg ? sg->data : sx->data) - (const char *) gate_up->data;
+        if (!sg) {
+            const bool swapped = ggml_get_op_params_i32(situ, 1) != 0;
+            xo += swapped ? D * ts : 0;
+            go += swapped ? 0 : D * ts;
+        }
+        auto same_rows = [&](const ggml_tensor * v) {
+            return !v || (v->view_src == gate_up && v->nb[1] == gate_up->nb[1] && v->nb[2] == gate_up->nb[2]);
+        };
+        if (sx->view_src == gate_up && same_rows(sx) && same_rows(sg) && xo >= 0 && go >= 0 && xo % ts == 0 &&
+            go % ts == 0 && xo / ts + D <= gate_up->ne[0] && go / ts + D <= gate_up->ne[0] &&
+            down->src[0]->ne[0] == D && D <= INT32_MAX) {
+            epi       = { nullptr, (int) (xo / ts), (int) (go / ts), (int) D, ggml_get_op_params_f32(situ, 2),
+                          ggml_get_op_params_f32(situ, 3), nullptr, 0 };
+            epi_combo = ggml_sycl_mul_mat_id_device_combo(ctx, down);
+        }
+    }
+    ggml_sycl_mmid_sched sched;
+    if (!ggml_sycl_mul_mat_id_device(ctx, gate_up, nullptr, &sched, epi_combo >= 0 ? &epi : nullptr, epi_combo)) {
+        return 0;
+    }
+    const bool packed_by_epi = sched.next_K != 0;
+    // The combine (OUT_PROD of the down output and the router weights) in two halves: the down epilogue scales
+    // each route's row by its weight and stores it as half, ggml_sycl_moe_combine_half() sums a token's rows.
+    // The [n_embd, n_used, n_tokens] f32 down output was written and read back once (151 MB a ub2048 ubatch).
+    const int     c      = packed_by_epi ? ggml_sycl_moe_combine_node(cgraph, j + 1) : -1;
+    ggml_tensor * comb   = c > 0 ? cgraph->nodes[c] : nullptr;
+    const bool    halves = comb && ggml_sycl_mul_mat_id_device(ctx, down, situ, &sched, nullptr, -1, comb->src[1]);
+    if (!halves && !ggml_sycl_mul_mat_id_device(ctx, down, situ, &sched)) {
+        // the combination check above makes the down call take the epilogue's B
+        GGML_ASSERT(!packed_by_epi && "the gate_up output was not written");
+        ggml_sycl_situ(ctx, situ);
+        ggml_sycl_mul_mat_id(ctx, down);
+    }
+    GGML_ASSERT(sched.next_K == 0 && "the down projection did not take the epilogue's B");
+    if (halves) {
+        ggml_sycl_moe_combine_half(ctx, comb, (const sycl::half *) down->data, (int) down->ne[1]);
+        return c - node_idx;
+    }
+    return j + 1 - node_idx;
+}
+// GGML_SYCL_NODE_PROF=1: wait on the queue around every computed node (not while recording) and print, per graph of at
+// least GGML_SYCL_NODE_PROF_MIN_NODES nodes, the host time per op and weight (blk.N stripped). A diagnostic: the
+// waits serialise the queue, so the totals are only shares.
+struct ggml_sycl_node_prof {
+    int enabled = -1;
+    int min_nodes = 1000;
+    std::map<std::string, std::pair<double, int>> acc;
+    std::string cur;
+    std::chrono::steady_clock::time_point t0;
+
+    static std::string key(const ggml_tensor * node) {
+        std::string k = ggml_op_desc(node);
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] && node->src[1]) {
+            const ggml_tensor * w = node->src[0]->view_src ? node->src[0]->view_src : node->src[0];
+            std::string n = w->name;
+            n = std::regex_replace(n, std::regex("blk\\.[0-9]+\\."), "");
+            char buf[160];
+            snprintf(buf, sizeof(buf), " %s[%s %lldx%lld%s] n=%lld%s", n.c_str(), ggml_type_name(node->src[0]->type),
+                     (long long) node->src[0]->ne[1], (long long) node->src[0]->ne[0],
+                     node->src[0]->view_src ? " view" : "", (long long) node->src[1]->ne[1],
+                     ggml_is_contiguous(node->src[1]) ? "" : " src1-nc");
+            k += buf;
+        }
+        return k;
+    }
+    void mark(queue_ptr q, const ggml_tensor * next) {
+        q->wait();
+        auto t = std::chrono::steady_clock::now();
+        if (!cur.empty()) {
+            auto & a = acc[cur];
+            a.first += std::chrono::duration<double, std::micro>(t - t0).count();
+            a.second += 1;
+        }
+        cur = next ? key(next) : std::string();
+        t0  = std::chrono::steady_clock::now();
+    }
+    void report(int n_nodes) {
+        if (n_nodes >= min_nodes) {
+            std::vector<std::pair<std::string, std::pair<double, int>>> v(acc.begin(), acc.end());
+            std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.first > b.second.first; });
+            double tot = 0;
+            for (auto & e : v) tot += e.second.first;
+            fprintf(stderr, "[node-prof] graph of %d nodes: %.2f ms\n", n_nodes, tot / 1e3);
+            for (auto & e : v) {
+                fprintf(stderr, "[node-prof] %9.3f ms %5d calls %8.1f us  %s\n", e.second.first / 1e3, e.second.second,
+                        e.second.first / e.second.second, e.first.c_str());
+            }
+        }
+        acc.clear();
+    }
+};
+static ggml_sycl_node_prof g_ggml_sycl_node_prof;
+
+#if GGML_SYCL_DNNL
+// a MUL_MAT among the next nodes that ggml_sycl_mul_mat() hands to the dense oneDNN path with node i as src1,
+// converted to f16 there: a fused producer of node i can write that copy itself (ggml_sycl_dense_dnn_act_reserve)
+static bool ggml_sycl_dense_dnn_reads_f16(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * t = cgraph->nodes[i];
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 16; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_MUL_MAT && n->src[1] == t && !ggml_backend_buffer_is_sycl_split(n->src[0]->buffer) &&
+            ggml_get_op_params_i32(n, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+            ggml_sycl_dense_dnn_converts_src1(ctx.device, n)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the queries of BLOCK_MIX node i whose plane-0 rows [n, n_tokens] (a reshape or row view of the node) are src1 of
+// a MUL_MAT among the next nodes that the dense oneDNN path converts to f16: the kernel can write those copies
+static bool ggml_sycl_block_mix_dense_reads(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int i, bool * f16) {
+    const ggml_tensor * t = cgraph->nodes[i];
+    bool any = false;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 96; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_CONCAT && ggml_sycl_dense_dnn_concat_reads_f16(ctx.device, cgraph, j)) {
+            // a half [ne0, 1, n_tokens] of the controller gate input: the plane-0 rows of a query
+            for (int h = 0; h < 2; ++h) {
+                const ggml_tensor * b = n->src[h];
+                if ((b != t && b->view_src != t) || b->type != GGML_TYPE_F32 || b->ne[0] != t->ne[0] ||
+                    b->ne[1] != 1 || b->ne[2] != t->ne[2] || b->ne[3] != 1 || b->nb[0] != sizeof(float) ||
+                    b->nb[2] != t->nb[2] || (const char *) b->data < (const char *) t->data) {
+                    continue;
+                }
+                const size_t offs = (const char *) b->data - (const char *) t->data;
+                if (offs % t->nb[1] == 0 && (int64_t) (offs / t->nb[1]) < t->ne[1]) {
+                    any = any || !f16[offs / t->nb[1]];
+                    f16[offs / t->nb[1]] = true;
+                }
+            }
+            continue;
+        }
+        if (n->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        const ggml_tensor * b = n->src[1];
+        if ((b != t && b->view_src != t) || b->type != GGML_TYPE_F32 || b->ne[0] != t->ne[0] || b->ne[1] != t->ne[2] ||
+            b->ne[2] != 1 || b->ne[3] != 1 || b->nb[0] != sizeof(float) || b->nb[1] != t->nb[2] ||
+            (const char *) b->data < (const char *) t->data) {
+            continue;
+        }
+        const size_t offs = (const char *) b->data - (const char *) t->data;
+        if (offs % t->nb[1] != 0 || (int64_t) (offs / t->nb[1]) >= t->ne[1] || f16[offs / t->nb[1]]) {
+            continue;
+        }
+        if (ggml_backend_buffer_is_sycl_split(n->src[0]->buffer) ||
+            ggml_get_op_params_i32(n, 1) == GGML_HINT_SRC0_IS_HADAMARD || !ggml_sycl_dense_dnn_converts_src1(ctx.device, n)) {
+            continue;
+        }
+        f16[offs / t->nb[1]] = true;
+        any = true;
+    }
+    return any;
+}
+
+// GGML_SYCL_DROP_F32: a producer that writes the f16 copy of its result for the dense matmuls can skip the f32
+// result when no node can read those f32 bytes. The proof is over the whole graph: every node after the producer
+// that references bytes of the result's root tensor (through any view) is checked, and those that overlap the rows
+// must all be MUL_MATs that the dense oneDNN path runs with exactly those rows as src1 (so they read the f16 copy,
+// which is pinned in the activation cache until the last of them, see ggml_sycl_dense_dnn_act_reserve).
+// touch[root] = the non-view nodes whose sources or in-place destination are views of root (or root itself)
+struct ggml_sycl_drop_f32_index {
+    const ggml_cgraph * graph = nullptr;
+    std::map<const ggml_tensor *, std::vector<int>> touch;
+};
+static thread_local ggml_sycl_drop_f32_index g_ggml_sycl_drop_f32_index;
+
+static const ggml_tensor * ggml_sycl_root(const ggml_tensor * t) {
+    return t->view_src ? t->view_src : t;
+}
+
+// the bytes of t (a view of root) can overlap the rows [M x K floats, row stride ld floats] at byte offset roff of root
+static bool ggml_sycl_rows_overlap(const ggml_tensor * root, const ggml_tensor * t, size_t roff, int64_t K, int64_t M,
+                                   int64_t ld) {
+    const size_t toff = (const char *) t->data - (const char *) root->data;
+    const size_t row  = (size_t) ld * sizeof(float);
+    // rows of the same stride: disjoint column ranges never meet
+    if (t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->ne[3] == 1 &&
+        ((t->ne[2] == 1 && t->nb[1] == row) || (t->ne[1] == 1 && t->nb[2] == row))) {
+        const size_t c0 = toff % row, c1 = c0 + t->ne[0] * sizeof(float);
+        const size_t r0 = roff % row, r1 = r0 + K * sizeof(float);
+        if (c1 <= row && r1 <= row && (c1 <= r0 || r1 <= c0)) {
+            return false;
+        }
+    }
+    const size_t rend = roff + (size_t) (M - 1) * row + K * sizeof(float);
+    return toff < rend && roff < toff + ggml_nbytes(t);
+}
+
+// the last node reading the f32 rows [data, M x K floats at row stride ld] of the result of node `producer` (all of
+// whose nodes up to `last_fused` are fused into it), when only dense matmuls that read the f16 copy read them; -1
+// when the f32 rows must be written
+static int ggml_sycl_drop_f32_last_reader_impl(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph,
+                                               int last_fused, const ggml_tensor * base, const void * data, int64_t K,
+                                               int64_t M, int64_t ld) {
+    if (!ggml_sycl_dense_dnn_drop_f32() || base->view_src || (base->flags & GGML_TENSOR_FLAG_OUTPUT) || !base->data) {
+        return -1;
+    }
+    auto & idx = g_ggml_sycl_drop_f32_index;
+    if (idx.graph != cgraph) {
+        idx.graph = cgraph;
+        idx.touch.clear();
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (ggml_sycl_is_view_or_noop(n)) {
+                continue;
+            }
+            const ggml_tensor * roots[GGML_MAX_SRC + 1];
+            int nr = 0;
+            if (n->view_src) {
+                roots[nr++] = n->view_src;
+            }
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (n->src[k]) {
+                    roots[nr++] = ggml_sycl_root(n->src[k]);
+                }
+            }
+            for (int k = 0; k < nr; ++k) {
+                auto & v = idx.touch[roots[k]];
+                if (v.empty() || v.back() != j) {
+                    v.push_back(j);
+                }
+            }
+        }
+    }
+    auto it = idx.touch.find(base);
+    if (it == idx.touch.end()) {
+        return -1;
+    }
+    const size_t roff = (const char *) data - (const char *) base->data;
+    int last = -1;
+    for (const int j : it->second) {
+        if (j <= last_fused) {
+            continue;
+        }
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->view_src == base && ggml_sycl_rows_overlap(base, n, roff, K, M, ld)) {
+            return -1; // writes into the rows
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (!s || ggml_sycl_root(s) != base || !ggml_sycl_rows_overlap(base, s, roff, K, M, ld)) {
+                continue;
+            }
+            const bool rows2d = s->data == data && s->type == GGML_TYPE_F32 && s->ne[0] == K && s->ne[1] == M &&
+                                s->ne[2] == 1 && s->ne[3] == 1 && s->nb[0] == sizeof(float) &&
+                                s->nb[1] == (size_t) ld * sizeof(float);
+            const bool rows3d = s->data == data && s->type == GGML_TYPE_F32 && s->ne[0] == K && s->ne[1] == 1 &&
+                                s->ne[2] == M && s->ne[3] == 1 && s->nb[0] == sizeof(float) &&
+                                s->nb[2] == (size_t) ld * sizeof(float);
+            // a half of a controller gate input on the f16 path of ggml_sycl_dense_dnn_concat_mul_mat()
+            if (n->op == GGML_OP_CONCAT && k < 2 && (rows2d || rows3d) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                ggml_sycl_dense_dnn_concat_ready(ctx.device, cgraph, j)) {
+                last = std::max(last, j);
+                continue;
+            }
+            const bool exact = k == 1 && rows2d;
+            // a dense oneDNN matmul of a copied weight, not taken by the MUL_MAT + MUL_MAT + GLU fusion
+            const bool dense = exact && n->op == GGML_OP_MUL_MAT && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                               ggml_sycl_root(n->src[0]) != base &&
+                               !ggml_backend_buffer_is_sycl_split(n->src[0]->buffer) &&
+                               ggml_get_op_params_i32(n, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+                               ggml_sycl_dense_dnn_converts_src1(ctx.device, n) &&
+                               ggml_sycl_dense_dnn_weight_ready(ctx.device, n->src[0]) &&
+                               !(j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_GLU) &&
+                               !(j + 2 < cgraph->n_nodes && cgraph->nodes[j + 2]->op == GGML_OP_GLU);
+            if (!dense) {
+                return -1;
+            }
+            last = std::max(last, j);
+        }
+    }
+    return last;
+}
+
+static int ggml_sycl_drop_f32_last_reader(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int last_fused,
+                                          const ggml_tensor * base, const void * data, int64_t K, int64_t M, int64_t ld) {
+    const int last = ggml_sycl_drop_f32_last_reader_impl(ctx, cgraph, last_fused, base, data, K, M, ld);
+    // GGML_SYCL_DROP_F32_DEBUG=1: the decisions in the first graphs of at least 1000 nodes (diagnostic)
+    static int dbg = ggml_sycl_get_env("GGML_SYCL_DROP_F32_DEBUG", 0) ? 600 : 0;
+    if (dbg > 0 && cgraph->n_nodes >= 1000) {
+        --dbg;
+        fprintf(stderr, "[drop-f32] node %d %s rows %lld x %lld +%zu: last reader %d %s\n", last_fused, base->name,
+                (long long) M, (long long) K, (size_t) ((const char *) data - (const char *) base->data), last,
+                last >= 0 ? cgraph->nodes[last]->name : "-");
+    }
+    return last;
+}
+#endif
+
+// One-column Q4_K products that share their activation in one launch (ggml_sycl_dmmv_multi, dmmv.cpp): the products
+// after node i run at node i, so every node in between that is not moved must neither write what a moved product
+// reads nor touch what it writes. GGML_SYCL_DMMV_MULTI=0 restores the per-node path.
+static bool ggml_sycl_dmmv_multi_eligible(ggml_backend_sycl_context & ctx, const ggml_tensor * n) {
+    if (n->op != GGML_OP_MUL_MAT || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    const ggml_tensor * w = n->src[0];
+    const ggml_tensor * x = n->src[1];
+    // GGML_SYCL_DMMV_MULTI_Q6=1: also the Q6_K weights (slower than the Q6_K kernel of the per-node path)
+    static const bool q6 = ggml_sycl_get_env("GGML_SYCL_DMMV_MULTI_Q6", 0) != 0;
+    if ((w->type != GGML_TYPE_Q4_K && !(q6 && w->type == GGML_TYPE_Q6_K)) || w->view_src || !ggml_is_contiguous(w) ||
+        !w->extra || ggml_backend_buffer_is_sycl_split(w->buffer) || w->ne[2] != 1 || w->ne[3] != 1 ||
+        !ggml_sycl_dmmv_multi_supported(w->type, w->ne[0])) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] != w->ne[0] || x->ne[1] != 1 || x->ne[2] != 1 ||
+        x->ne[3] != 1 || n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) || (uintptr_t) x->data % 16 != 0 ||
+        (uintptr_t) w->data % 16 != 0) {
+        return false;
+    }
+    return ggml_get_op_params_i32(n, 1) != GGML_HINT_SRC0_IS_HADAMARD && g_ggml_sycl_enable_esimd &&
+           !g_ggml_sycl_prioritize_dmmv && should_reorder_tensor(ctx, n);
+}
+
+static bool ggml_sycl_bytes_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!a || !b || !a->data || !b->data) {
+        return false;
+    }
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// a and b cannot swap order or run at once: one writes what the other reads or writes
+static bool ggml_sycl_nodes_conflict(const ggml_tensor * a, const ggml_tensor * b) {
+    if (ggml_sycl_bytes_overlap(a, b)) {
+        return true;
+    }
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        if (ggml_sycl_bytes_overlap(a, b->src[s]) || ggml_sycl_bytes_overlap(b, a->src[s])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_sycl_dmmv_multi_try(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int i,
+                                     std::vector<uint8_t> & done) {
+    // GGML_SYCL_DMMV_MULTI_MAXSEG: products per launch (1..4; 1 still uses the kernel, which beats the per-node one)
+    static const int max_seg = std::min(ggml_sycl_get_env("GGML_SYCL_DMMV_MULTI_MAXSEG", GGML_SYCL_DMMV_MULTI_MAX),
+                                        GGML_SYCL_DMMV_MULTI_MAX);
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!ggml_sycl_dmmv_multi_eligible(ctx, node)) {
+        return false;
+    }
+    const ggml_tensor * x = node->src[1];
+    const int64_t       K = x->ne[0];
+
+    // a product read by a GLU keeps the gate/up fusions of ggml_sycl_fuse
+    auto feeds_glu = [&](int j) {
+        for (int k = j + 1; k < cgraph->n_nodes && k <= j + 4; ++k) {
+            const ggml_tensor * n = cgraph->nodes[k];
+            if (n->op == GGML_OP_GLU && (n->src[0] == cgraph->nodes[j] || n->src[1] == cgraph->nodes[j])) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (feeds_glu(i)) {
+        return false;
+    }
+
+    std::vector<int> moved = { i }; // the products of this launch
+    auto try_move = [&](int q) {
+        const ggml_tensor * t = cgraph->nodes[q];
+        for (int k = i + 1; k < q; ++k) {
+            const ggml_tensor * n = cgraph->nodes[k];
+            if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || done[k] ||
+                std::find(moved.begin(), moved.end(), k) != moved.end()) {
+                continue;
+            }
+            if (ggml_sycl_nodes_conflict(t, n)) {
+                return false;
+            }
+        }
+        for (int m : moved) {
+            if (ggml_sycl_nodes_conflict(t, cgraph->nodes[m])) {
+                return false;
+            }
+        }
+        moved.push_back(q);
+        return true;
+    };
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 40 && (int) moved.size() < max_seg; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(n) || done[j]) {
+            continue;
+        }
+        if (ggml_sycl_bytes_overlap(n, x)) {
+            break; // the shared activation is rewritten
+        }
+        if (n->src[1] && n->src[1]->data == x->data && ggml_sycl_dmmv_multi_eligible(ctx, n) && n->src[0]->ne[0] == K &&
+            n->src[0]->type == node->src[0]->type && !feeds_glu(j)) {
+            try_move(j);
+        }
+    }
+
+    ggml_sycl_dmmv_multi_args args = {};
+    for (int m : moved) {
+        const ggml_tensor * t = cgraph->nodes[m];
+        opt_for_reorder(&ctx, t->src[0], t->src[1], const_cast<ggml_tensor *>(t), mul_mat_algo::DMMV);
+        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(t->src[0]->extra);
+        if (!extra || !extra->optimized_feature.reorder) {
+            return false;
+        }
+        ggml_sycl_dmmv_multi_seg & s = args.seg[args.nseg++];
+        s.w     = t->src[0]->data;
+        s.dst   = (float *) t->data;
+        s.nrows = (int) t->src[0]->ne[1];
+        s.type  = t->src[0]->type;
+    }
+    if (!ggml_sycl_dmmv_multi(args, (const float *) x->data, (int) K, ctx.stream())) {
+        return false;
+    }
+    for (int m : moved) {
+        done[m] = 1;
+    }
+    return true;
+}
+
+// The MoE GEMV of the n tokens of a row-exact graph (n * K routes of K experts) in one launch of the one-token fused
+// MMVQ kernel (ggml_sycl_mul_mat_id_mmvq_fused): the routes sorted by expert (GGML_SYCL_ROW_EXACT_MOE_SORT=0: in token
+// order), so the work-groups of one expert run together and its blocks come from the cache; the activation row of each
+// route gathered into a row of its own (the one-token launch of the up and gate products shares one row across the K
+// routes); the route results scattered back. Every route runs the work-groups of the one-token launch on the same
+// quantized row, so the results are those of n one-token launches. By default the launch is the grouped form of that
+// kernel (ggml_sycl_mul_mat_vec_q_id_grouped: one work-group row per expert, its routes in turn). False, with nothing
+// queued, if not handled.
+static bool ggml_sycl_row_exact_moe_flat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    const int64_t K     = ids->ne[0];
+    const int64_t n     = ids->ne[1];
+    const int64_t ne10  = src1->ne[0];
+    const int64_t ne11  = src1->ne[1];
+    const int64_t nrows = src0->ne[1];
+    const int     R     = (int) (K * n);
+    constexpr int R_MAX = 256;
+    if (R > R_MAX || src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) || src1->nb[1] != ne10 * sizeof(float) ||
+        src1->nb[2] % sizeof(float) != 0 || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) ||
+        ids->nb[1] % sizeof(int32_t) != 0 || dst->type != GGML_TYPE_F32 || dst->nb[0] != sizeof(float) ||
+        dst->nb[1] % sizeof(float) != 0 || dst->nb[2] % sizeof(float) != 0 || (ne11 != 1 && ne11 != K) ||
+        dst->ne[0] != nrows || dst->ne[1] != K) {
+        return false;
+    }
+    opt_for_reorder_id(&ctx, src0);
+    const ggml_tensor_extra_gpu * src0_extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
+    if (use_reorder && !ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type)) {
+        return false;
+    }
+    static const bool sort = ggml_sycl_get_env("GGML_SYCL_ROW_EXACT_MOE_SORT", 1) != 0;
+    // GGML_SYCL_ROW_EXACT_MOE_GROUP=0: a work-group row per route (else per group of routes of one expert, which
+    // reads the expert's blocks once for the group: ggml_sycl_mul_mat_vec_q_id_grouped)
+    static const bool group_env = ggml_sycl_get_env("GGML_SYCL_ROW_EXACT_MOE_GROUP", 1) != 0;
+    const bool grouped = group_env && sort && n <= 8 && ggml_sycl_mul_mat_vec_q_id_grouped_supports(src0->type, use_reorder);
+    const queue_ptr stream = ctx.stream();
+    const int       padded = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
+    const size_t    qrow   = (size_t) padded * sizeof(block_q8_1) / QK8_1;
+
+    ggml_sycl_pool_alloc<int32_t> rid_a(ctx.pool(), 5 * R);
+    ggml_sycl_pool_alloc<float>   xs_a(ctx.pool(), (size_t) R * ne10);
+    ggml_sycl_pool_alloc<char>    q_a(ctx.pool(), (size_t) R * qrow);
+    ggml_sycl_pool_alloc<float>   dt_a(ctx.pool(), (size_t) R * nrows);
+    int32_t *       rid  = rid_a.get();   // [R] expert of the route in slot p
+    int32_t *       perm = rid + R;       // [R] route (t * K + k) in slot p
+    int32_t *       grp  = rid + 2 * R;   // [3R] expert, first slot, slot count of each group of slots
+    float *         xs   = xs_a.get();
+    float *         dt   = dt_a.get();
+    const int32_t * ids_d = (const int32_t *) ids->data;
+    const size_t    ids_s = ids->nb[1] / sizeof(int32_t);
+    const int       Ki    = (int) K;
+    const bool      by_e  = sort;
+
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<int32_t, 1> e(sycl::range<1>(R_MAX), h);
+        sycl::local_accessor<int32_t, 1> se(sycl::range<1>(R_MAX), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(R), sycl::range<1>(R)), [=](sycl::nd_item<1> it) {
+            const int r = (int) it.get_local_id(0);
+            const int t = r / Ki;
+            e[r]        = ids_d[t * ids_s + (r - t * Ki)];
+            it.barrier(sycl::access::fence_space::local_space);
+            int rank = r;
+            if (by_e) {
+                const int er = e[r];
+                rank         = 0;
+                for (int j = 0; j < R; ++j) {
+                    const int ej = e[j];
+                    rank += ej < er || (ej == er && j < r);
+                }
+            }
+            rid[rank]  = e[r];
+            perm[rank] = r;
+            se[rank]   = e[r];
+            it.barrier(sycl::access::fence_space::local_space);
+            // the groups: runs of one expert in the sorted slots
+            int gi = 0;
+            int ng = 0;
+            for (int j = 0; j < R; ++j) {
+                const int st = j == 0 || se[j - 1] != se[j];
+                ng += st;
+                gi += st && j < r;
+            }
+            if (r == 0 || se[r - 1] != se[r]) {
+                int len = 1;
+                while (r + len < R && se[r + len] == se[r]) {
+                    ++len;
+                }
+                grp[gi]         = se[r];
+                grp[R + gi]     = r;
+                grp[2 * R + gi] = len;
+            }
+            if (r >= ng) {
+                grp[2 * R + r] = 0;
+            }
+        });
+    });
+    {
+        const float *  x   = (const float *) src1->data;
+        const size_t   s11 = ne11 == 1 ? 0 : src1->nb[1] / sizeof(float);
+        const size_t   s12 = src1->nb[2] / sizeof(float);
+        const int      nc  = (int) ne10;
+        const size_t   tot = (size_t) R * nc;
+        constexpr int  WG  = 256;
+        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((tot + WG - 1) / WG * WG), sycl::range<1>(WG)),
+                             [=](sycl::nd_item<1> it) {
+                                 const size_t gi = it.get_global_id(0);
+                                 if (gi >= tot) {
+                                     return;
+                                 }
+                                 const int p   = (int) (gi / nc);
+                                 const int col = (int) (gi - (size_t) p * nc);
+                                 const int r   = perm[p];
+                                 const int t   = r / Ki;
+                                 xs[gi]        = x[t * s12 + (r - t * Ki) * s11 + col];
+                             });
+    }
+    if (use_reorder) {
+        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(xs, q_a.get(), (int) ne10, R, padded, stream);
+    } else {
+        quantize_row_q8_1_sycl<quantize_q8_1>(xs, q_a.get(), (int) ne10, R, padded, stream);
+    }
+    if (grouped) {
+        ggml_sycl_mul_mat_vec_q_id_grouped(src0->type, use_reorder, src0->data, q_a.get(), grp, dt, (int) ne10,
+                                           (int) nrows, R, src0->nb[2], nrows * sizeof(float), qrow, stream);
+    } else if (use_reorder) {
+        ggml_sycl_mul_mat_vec_q_id_reorder(src0->type, src0->data, q_a.get(), rid, dt, (int) ne10, (int) nrows, R,
+                                           src0->nb[2], nrows * sizeof(float), qrow, stream);
+    } else {
+        ggml_sycl_mul_mat_vec_q_id(src0->type, src0->data, q_a.get(), rid, dt, (int) ne10, (int) nrows, R,
+                                   src0->nb[2], nrows * sizeof(float), qrow, stream);
+    }
+    {
+        float *       d   = (float *) dst->data;
+        const size_t  d1  = dst->nb[1] / sizeof(float);
+        const size_t  d2  = dst->nb[2] / sizeof(float);
+        const int     nr  = (int) nrows;
+        const size_t  tot = (size_t) R * nr;
+        constexpr int WG  = 256;
+        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((tot + WG - 1) / WG * WG), sycl::range<1>(WG)),
+                             [=](sycl::nd_item<1> it) {
+                                 const size_t gi = it.get_global_id(0);
+                                 if (gi >= tot) {
+                                     return;
+                                 }
+                                 const int p   = (int) (gi / nr);
+                                 const int row = (int) (gi - (size_t) p * nr);
+                                 const int r   = perm[p];
+                                 const int t   = r / Ki;
+                                 d[t * d2 + (r - t * Ki) * d1 + row] = dt[gi];
+                             });
+    }
+    return true;
+}
+
+// A quantized weight product of 2..GGML_SYCL_ROW_EXACT_MAX columns in a row-exact graph (g_ggml_sycl_row_exact):
+// each column (MUL_MAT) or token (MUL_MAT_ID) as the one-token decode computes it, through a one-column view of the
+// activation and the result: the one-column DMMV (ggml_sycl_dmmv_multi) when the decode takes it, else the per-node
+// mat-vec (ggml_sycl_mul_mat), and the one-token MoE GEMV (ggml_sycl_mul_mat_id); and a row-exact attention of 5..max
+// query rows as slices of 4 rows, the rows of the decode kernel (FA_DEC_MAX_Q). False, with nothing queued, when the
+// node is none of these.
+static bool ggml_sycl_row_exact_node(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node  = cgraph->nodes[i];
+    const int     max_n = ggml_sycl_row_exact_max();
+    // a single row of a tensor as a contiguous one-row tensor at row r (dims 1..3 of size 1)
+    auto row_of = [](const ggml_tensor * t, int dim, int64_t r) {
+        ggml_tensor v = *t;
+        v.data        = (char *) t->data + r * t->nb[dim];
+        v.ne[dim]     = 1;
+        for (int d = dim + 1; d < GGML_MAX_DIMS; ++d) {
+            v.nb[d] = v.nb[d - 1] * v.ne[d - 1];
+        }
+        return v;
+    };
+    if (node->op == GGML_OP_MUL_MAT) {
+        const ggml_tensor * w = node->src[0];
+        const ggml_tensor * x = node->src[1];
+        const int64_t       n = x->ne[1];
+        if (n < 2 || n > max_n || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_quantized(w->type) ||
+            x->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) ||
+            node->nb[0] != sizeof(float) || ggml_backend_buffer_is_sycl_split(w->buffer) ||
+            ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+            return false;
+        }
+        // a product read by a GLU: the decode fuses gate, up and GLU (not mirrored here)
+        for (int k = i + 1; k < cgraph->n_nodes && k <= i + 4; ++k) {
+            const ggml_tensor * t = cgraph->nodes[k];
+            if (t->op == GGML_OP_GLU && (t->src[0] == node || t->src[1] == node)) {
+                return false;
+            }
+        }
+        // GGML_SYCL_ROW_EXACT_NC=0: one launch per column (else the columns of a one-column DMMV share a launch)
+        static const bool nc = ggml_sycl_get_env("GGML_SYCL_ROW_EXACT_NC", 1) != 0;
+        const size_t      ys = x->nb[1] / sizeof(float);
+        const size_t      ds = node->nb[1] / sizeof(float);
+        for (int64_t c = 0; c < n; ++c) {
+            ggml_tensor xc = row_of(x, 1, c);
+            xc.nb[1] = xc.nb[2] = xc.nb[3] = xc.ne[0] * sizeof(float);
+            ggml_tensor dc = row_of(node, 1, c);
+            dc.nb[1] = dc.nb[2] = dc.nb[3] = dc.ne[0] * sizeof(float);
+            dc.src[1] = &xc;
+            const int ncol = nc && c == 0 && x->nb[1] % sizeof(float) == 0 && node->nb[1] % sizeof(float) == 0 ? (int) n : 1;
+            bool done = false;
+            if (ggml_sycl_dmmv_multi_eligible(ctx, &dc)) {
+                opt_for_reorder(&ctx, w, &xc, &dc, mul_mat_algo::DMMV);
+                const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(w->extra);
+                if (extra && extra->optimized_feature.reorder) {
+                    ggml_sycl_dmmv_multi_args args = {};
+                    ggml_sycl_dmmv_multi_seg & sg = args.seg[args.nseg++];
+                    sg.w     = w->data;
+                    sg.dst   = (float *) dc.data;
+                    sg.nrows = (int) w->ne[1];
+                    sg.type  = w->type;
+                    args.ncol       = ncol;
+                    args.y_stride   = ys;
+                    args.dst_stride = ds;
+                    done = ggml_sycl_dmmv_multi(args, (const float *) xc.data, (int) xc.ne[0], ctx.stream());
+                    if (done && ncol > 1) {
+                        return true;
+                    }
+                }
+            }
+            if (!done) {
+                // the one-column ESIMD DMMV of the per-node path takes every column when it runs (dmmv.hpp)
+                g_ggml_sycl_dmmv_nc = { (const float *) xc.data, (float *) dc.data, ncol, ys, ds, false };
+                ggml_sycl_mul_mat(ctx, w, &xc, &dc);
+                const bool all = g_ggml_sycl_dmmv_nc.used;
+                g_ggml_sycl_dmmv_nc = {};
+                if (all && ncol > 1) {
+                    return true;
+                }
+            }
+        }
+        return true;
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        // past the 4 query tokens of the decode kernel (fattn-dpas.cpp, FA_DEC_MAX_Q, whose rows do not depend on
+        // the batch) the attention runs in chunks of 4 tokens through it: views of Q, of the per-head mask and of the
+        // result at the chunk's tokens (the sinks are per head)
+        constexpr int64_t   CH   = 4;
+        const ggml_tensor * q    = node->src[0];
+        const ggml_tensor * mask = node->src[3];
+        const int64_t       n    = q->ne[1];
+        if (n <= CH || n > max_n || ggml_get_op_params_i32(node, 6) == 0 || !mask || mask->ne[1] < n ||
+            node->src[5] || node->src[6] || node->src[7] || q->ne[3] != 1 || mask->ne[3] != 1 || node->ne[2] != n ||
+            node->ne[3] != 1) {
+            return false;
+        }
+        // a REL_BIAS mask packed for the decode kernel (it takes this row-exact op whole, GGML_SYCL_FA_DEC_ROWEXACT)
+        // is no per-row f16 mask that views could slice: the op runs as it is
+        if (mask->op == GGML_OP_REL_BIAS && ggml_sycl_flash_attn_ext_dpas_dec_rel_ok(node, mask)) {
+            return false;
+        }
+        for (int64_t c0 = 0; c0 < n; c0 += CH) {
+            const int64_t m  = std::min(CH, n - c0);
+            ggml_tensor   qv = *q;
+            qv.ne[1]         = m;
+            qv.data          = (char *) q->data + c0 * q->nb[1];
+            ggml_tensor mv   = *mask;
+            mv.ne[1]         = m;
+            mv.data          = (char *) mask->data + c0 * mask->nb[1];
+            ggml_tensor dv   = *node;
+            dv.ne[2]         = m;
+            dv.data          = (char *) node->data + c0 * node->nb[2];
+            dv.src[0]        = &qv;
+            dv.src[3]        = &mv;
+            ggml_sycl_flash_attn_ext(ctx, &dv);
+        }
+        return true;
+    }
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const ggml_tensor * src1 = node->src[1];
+        const ggml_tensor * ids  = node->src[2];
+        const int64_t       n    = src1->ne[2];
+        if (n < 2 || n > max_n || ids->ne[1] != n || src1->ne[3] != 1 || node->ne[3] != 1 || ids->ne[2] != 1 ||
+            ggml_backend_buffer_is_sycl_split(node->src[0]->buffer)) {
+            return false;
+        }
+        ggml_tensor s1[2], it[2], dt[2];
+        auto token = [&](int64_t t, int k) {
+            s1[k] = row_of(src1, 2, t);
+            it[k] = row_of(ids, 1, t);
+            dt[k] = row_of(node, 2, t);
+            dt[k].src[1] = &s1[k];
+            dt[k].src[2] = &it[k];
+        };
+        token(0, 0);
+        if (!ggml_sycl_mul_mat_id_should_use_mmvq(&dt[0])) {
+            return false;
+        }
+        // GGML_SYCL_ROW_EXACT_MOE_FLAT=0: one launch per token
+        static const bool flat = ggml_sycl_get_env("GGML_SYCL_ROW_EXACT_MOE_FLAT", 1) != 0;
+        if (flat && ggml_sycl_row_exact_moe_flat(ctx, node)) {
+            return true;
+        }
+        for (int64_t t = 0; t < n; ++t) {
+            token(t, 1);
+            ggml_sycl_mul_mat_id(ctx, &dt[1]);
+        }
+        return true;
+    }
+    return false;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_conv_window_match conv_window;
+    auto & prof = g_ggml_sycl_node_prof;
+    if (prof.enabled < 0) {
+        prof.enabled   = ggml_sycl_get_env("GGML_SYCL_NODE_PROF", 0);
+        prof.min_nodes = ggml_sycl_get_env("GGML_SYCL_NODE_PROF_MIN_NODES", 1000);
+    }
+    bool prof_on = prof.enabled != 0;
+    {
+        // GGML_SYCL_GRAPH_DUMP=<min nodes>: print the nodes of the first graph of at least that many nodes (diagnostic)
+        static int dump_min = ggml_sycl_get_env("GGML_SYCL_GRAPH_DUMP", 0);
+        if (dump_min > 0 && cgraph->n_nodes >= dump_min) {
+            dump_min = 0;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                const ggml_tensor * n = cgraph->nodes[i];
+                fprintf(stderr, "[gd] %5d %-14s %-28s [%lld,%lld,%lld,%lld] nb[%zu,%zu,%zu]%s", i, ggml_op_desc(n), n->name,
+                        (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                        n->nb[1], n->nb[2], n->nb[3], ggml_is_contiguous(n) ? "" : " nc");
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    if (n->src[j]) {
+                        fprintf(stderr, " | %s", n->src[j]->name);
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+#ifdef GGML_SYCL_GRAPH
+    // a queue that is recording a SYCL graph cannot be waited on
+    prof_on = prof_on && sycl_ctx->stream()->ext_oneapi_get_state() !=
+                             sycl::ext::oneapi::experimental::queue_state::recording;
+#endif
+#if GGML_SYCL_DNNL
+    ggml_sycl_dense_dnn_graph_begin(*sycl_ctx);
+    int dense_dnn_checked = 0; // nodes before this one have been checked for writes into converted activations
+    g_ggml_sycl_drop_f32_index.graph = nullptr; // the same cgraph object may hold a new graph
+    // the f32 rows of the result of the fused nodes [i, last] as a 2D tensor t: their last reader, or -1 (keep them)
+    auto drop_f32_pin = [&](int last, const ggml_tensor * t) {
+        int64_t M = t->ne[1];
+        int64_t ld = t->nb[1] / sizeof(float);
+        if (t->type != GGML_TYPE_F32 || t->ne[3] != 1 || t->nb[0] != sizeof(float) || t->nb[1] % sizeof(float) != 0 ||
+            t->ne[2] != 1) {
+            return -1;
+        }
+        return ggml_sycl_drop_f32_last_reader(*sycl_ctx, cgraph, last, ggml_sycl_root(t), t->data, t->ne[0], M, ld);
+    };
+#endif
+    // nodes already run by a fusion that moved them forward (ggml_sycl_dmmv_multi_try)
+    static const bool dmmv_multi = ggml_sycl_get_env("GGML_SYCL_DMMV_MULTI", 1) != 0;
+    std::vector<uint8_t> moved_done(dmmv_multi ? cgraph->n_nodes : 0, 0);
+    const bool row_exact = ggml_sycl_row_exact_graph(cgraph);
+    g_ggml_sycl_row_exact = row_exact;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+#if GGML_SYCL_DNNL
+        ggml_sycl_dense_dnn_set_node(*sycl_ctx, i);
+        // the nodes a fusion skipped are checked here too
+        for (; dense_dnn_checked <= i; ++dense_dnn_checked) {
+            const ggml_tensor * n = cgraph->nodes[dense_dnn_checked];
+            if (!ggml_sycl_is_view_or_noop(n)) {
+                ggml_sycl_dense_dnn_node_writes(*sycl_ctx, n);
+            }
+        }
+#endif
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (dmmv_multi && moved_done[i]) {
+            continue;
+        }
+        if (prof_on) {
+            prof.mark(sycl_ctx->stream(), node);
+        }
+        if (row_exact &&
+            (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_FLASH_ATTN_EXT) &&
+            ggml_sycl_row_exact_node(*sycl_ctx, cgraph, i)) {
+            continue;
+        }
+        if (dmmv_multi && node->op == GGML_OP_MUL_MAT && ggml_sycl_dmmv_multi_try(*sycl_ctx, cgraph, i, moved_done)) {
             continue;
         }
 
@@ -6729,6 +8288,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 
+        // a REL_BIAS node whose flash attention computes the bias in its kernel (GGML_SYCL_FA_REL_INKERNEL)
+        if (node->op == GGML_OP_REL_BIAS && ggml_sycl_rel_bias_fa_pack_node(*sycl_ctx, cgraph, i)) {
+            continue;
+        }
+        if (node->op == GGML_OP_UNARY) {
+            const int n_route = ggml_sycl_route_fuse(*sycl_ctx, cgraph, i);
+            if (n_route != 0) {
+                i += n_route;
+                continue;
+            }
+        }
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
             i += nodes_to_skip;
@@ -6758,6 +8328,106 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i += 2;
             continue;
         }
+#if GGML_SYCL_DNNL
+        // the gains|forgets matmul, the mix, the norm and its weight as one kernel (GGML_SYCL_GATE_MIX_FUSED, see
+        // gate-mix-mm.hpp), at the batch sizes of the oneDNN path below
+        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_gate_mix_mm_match(*sycl_ctx, cgraph, i) &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_GATE_MIX, GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
+            !ggml_backend_buffer_is_sycl_split(node->src[0]->buffer) &&
+            ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+            ggml_sycl_dense_dnn_converts_src1(sycl_ctx->device, node) && ggml_sycl_gate_mix_mm_ready(*sycl_ctx, cgraph, i)) {
+            // an f16 copy of z in the cache is copied out first: the result's f16 copy may take its slot
+            ggml_sycl_pool_alloc<sycl::half> zc(sycl_ctx->pool());
+            const void * z16 = ggml_sycl_gate_mix_mm_z16(*sycl_ctx, cgraph, i);
+            if (z16) {
+                const size_t nz = (size_t) node->src[1]->ne[0] * ggml_nrows(node->src[1]);
+                zc.alloc(nz);
+                sycl_ctx->stream()->memcpy(zc.get(), z16, nz * sizeof(sycl::half));
+                z16 = zc.get();
+            }
+            // node i has read its activation: the fused writes below may reuse its bytes
+            ggml_sycl_dense_dnn_set_node(*sycl_ctx, i + 1);
+            for (; dense_dnn_checked <= i + 3; ++dense_dnn_checked) {
+                ggml_sycl_dense_dnn_node_writes(*sycl_ctx, cgraph->nodes[dense_dnn_checked]);
+            }
+            const bool f16_for_dense = ggml_sycl_dense_dnn_reads_f16(*sycl_ctx, cgraph, i + 3);
+            const int  pin = f16_for_dense ? drop_f32_pin(i + 3, cgraph->nodes[i + 3]) : -1;
+            ggml_sycl_gate_mix_mm_run(*sycl_ctx, cgraph, i, z16, f16_for_dense, pin);
+            i += 3;
+            continue;
+        }
+#endif
+#if GGML_SYCL_DNNL
+        // the gains|forgets matmul of a mix: oneDNN writes tanh(gains|forgets) as f16 into a scratch buffer, which
+        // the fused mix + norm reads instead of the f32 result (never written)
+        static const bool gate_mm_f16 = ggml_sycl_get_env("GGML_SYCL_GATE_MIX_MM_F16", 1) != 0;
+        if (gate_mm_f16 && node->op == GGML_OP_MUL_MAT && i + 3 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_GATE_MIX &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_GATE_MIX, GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
+            !ggml_backend_buffer_is_sycl_split(node->src[0]->buffer) &&
+            ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+            ggml_sycl_dense_dnn_converts_src1(sycl_ctx->device, node) &&
+            ggml_sycl_op_gate_mix_rms_norm_mul(*sycl_ctx, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                                               cgraph->nodes[i + 3], false, nullptr, true)) {
+            ggml_sycl_pool_alloc<sycl::half> gates(sycl_ctx->pool(), ggml_nelements(node));
+            if (ggml_sycl_dense_dnn_mul_mat_f16(*sycl_ctx, node, gates.get(), true)) {
+                // node i has read its activation: the fused writes below may reuse its bytes
+                ggml_sycl_dense_dnn_set_node(*sycl_ctx, i + 1);
+                for (; dense_dnn_checked <= i + 3; ++dense_dnn_checked) {
+                    ggml_sycl_dense_dnn_node_writes(*sycl_ctx, cgraph->nodes[dense_dnn_checked]);
+                }
+                const bool f16_for_dense = ggml_sycl_dense_dnn_reads_f16(*sycl_ctx, cgraph, i + 3);
+                const int  pin = f16_for_dense ? drop_f32_pin(i + 3, cgraph->nodes[i + 3]) : -1;
+                const bool ok = ggml_sycl_op_gate_mix_rms_norm_mul(*sycl_ctx, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                                                                   cgraph->nodes[i + 3], f16_for_dense, gates.get(),
+                                                                   false, pin);
+                GGML_ASSERT(ok);
+                i += 3;
+                continue;
+            }
+        }
+#endif
+        if (node->op == GGML_OP_GATE_MIX &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_GATE_MIX, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+            bool f16_for_dense = false;
+#if GGML_SYCL_DNNL
+            // the fused nodes write their bytes now: drop the converted copies they overlap before the kernel
+            // registers its own f16 copy of the result
+            for (; dense_dnn_checked <= i + 2; ++dense_dnn_checked) {
+                ggml_sycl_dense_dnn_node_writes(*sycl_ctx, cgraph->nodes[dense_dnn_checked]);
+            }
+            f16_for_dense = ggml_sycl_dense_dnn_reads_f16(*sycl_ctx, cgraph, i + 2);
+            const int pin = f16_for_dense ? drop_f32_pin(i + 2, cgraph->nodes[i + 2]) : -1;
+#else
+            const int pin = -1;
+#endif
+            if (ggml_sycl_op_gate_mix_rms_norm_mul(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                                                   f16_for_dense, nullptr, false, pin)) {
+                i += 2;
+                continue;
+            }
+        }
+#if GGML_SYCL_DNNL
+        // a mix whose rows feed dense oneDNN matmuls writes their f16 copies (its own writes were checked above)
+        if (node->op == GGML_OP_BLOCK_MIX && node->ne[1] <= 4) {
+            bool f16[4] = {};
+            if (ggml_sycl_block_mix_dense_reads(*sycl_ctx, cgraph, i, f16)) {
+                // plane-0 rows of query j: [ne0, n_tokens] at row stride nb[2]
+                int pin[4] = { -1, -1, -1, -1 };
+                if (node->ne[3] >= 1 && node->nb[2] % sizeof(float) == 0) {
+                    for (int j = 0; j < node->ne[1]; ++j) {
+                        if (f16[j]) {
+                            pin[j] = ggml_sycl_drop_f32_last_reader(*sycl_ctx, cgraph, i, node,
+                                                                    (const char *) node->data + j*node->nb[1],
+                                                                    node->ne[0], node->ne[2], node->nb[2] / sizeof(float));
+                        }
+                    }
+                }
+                ggml_sycl_block_mix(*sycl_ctx, node, f16, pin);
+                continue;
+            }
+        }
+#endif
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
             ggml_sycl_op_rms_norm_fused_add(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
@@ -6766,6 +8436,19 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+#if GGML_SYCL_DNNL
+            if (ggml_sycl_dense_dnn_reads_f16(*sycl_ctx, cgraph, i + 1)) {
+                // as for GATE_MIX above: the pair's writes are checked before the kernel registers its f16 copy
+                for (; dense_dnn_checked <= i + 1; ++dense_dnn_checked) {
+                    ggml_sycl_dense_dnn_node_writes(*sycl_ctx, cgraph->nodes[dense_dnn_checked]);
+                }
+                if (ggml_sycl_op_rms_norm_mul_f16(*sycl_ctx, node, cgraph->nodes[i + 1],
+                                                  drop_f32_pin(i + 1, cgraph->nodes[i + 1]))) {
+                    i++;
+                    continue;
+                }
+            }
+#endif
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
             i++;
             continue;
@@ -6786,6 +8469,19 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (node->op == GGML_OP_UNARY &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
+#if GGML_SYCL_DNNL
+            if (ggml_sycl_dense_dnn_reads_f16(*sycl_ctx, cgraph, i + 1)) {
+                // as for GATE_MIX: the pair's writes are checked before its f16 copy is registered
+                for (; dense_dnn_checked <= i + 1; ++dense_dnn_checked) {
+                    ggml_sycl_dense_dnn_node_writes(*sycl_ctx, cgraph->nodes[dense_dnn_checked]);
+                }
+                if (ggml_sycl_op_unary_mul_fused_f16(*sycl_ctx, node, cgraph->nodes[i + 1],
+                                                     drop_f32_pin(i + 1, cgraph->nodes[i + 1]))) {
+                    i++;
+                    continue;
+                }
+            }
+#endif
             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
             i++;
             continue;
@@ -6826,8 +8522,30 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+#if GGML_SYCL_DNNL
+        if (node->op == GGML_OP_CONCAT) {
+            const int skip = ggml_sycl_dense_dnn_concat_mul_mat(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+#endif
+
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_fused(*sycl_ctx, cgraph, i)) {
             i += 2;
+            continue;
+        }
+
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            const int moe_skip = ggml_sycl_moe_block_fused(*sycl_ctx, cgraph, i);
+            if (moe_skip > 0) {
+                i += moe_skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_GLU && ggml_sycl_mul_mat_id_situ_fused(*sycl_ctx, cgraph, i)) {
+            i++;
             continue;
         }
 
@@ -6836,6 +8554,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+    g_ggml_sycl_row_exact = false;
+    if (prof_on) {
+        prof.mark(sycl_ctx->stream(), nullptr);
+        prof.report(cgraph->n_nodes);
     }
 }
 
@@ -6887,6 +8610,10 @@ static bool mul_mat_uses_onednn(int device, ggml_tensor * dst) {
 #if GGML_SYCL_DNNL
     if (!g_ggml_sycl_enable_dnn) {
         return false;
+    }
+
+    if (ggml_sycl_dense_dnn_eligible(device, dst)) {
+        return true;
     }
 
     ggml_tensor * src0 = dst->src[0];
@@ -6951,6 +8678,12 @@ static bool ggml_sycl_mul_mat_id_needs_sync(ggml_backend_sycl_context * ctx, con
         return reordered ? !ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type) :
                            !ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type);
     }
+    if (ggml_sycl_mul_mat_id_mc_eligible(dst) && ggml_sycl_mmid_mc_supports_type(src0->type, reordered) &&
+        (src1->ne[2] <= g_ggml_sycl_mmid_mc_max ||
+         (ggml_sycl_xmx_enabled(ctx->device) &&
+          ggml_sycl_mmid_mc_xmx_supported(src0->type, reordered, (int) src0->ne[0], src0->nb[2], src0->data)))) {
+        return false;
+    }
     return !ggml_sycl_mul_mat_id_device_sched_eligible(dst) ||
            !ggml_sycl_grouped_dequant_gemm_device_supported(src0->type, reordered, ggml_sycl_src1_prec(dst),
                src0->ne[2], ids->ne[0], ids->ne[1], src0->ne[1], src0->ne[0], ctx->stream());
@@ -6959,7 +8692,8 @@ static bool ggml_sycl_mul_mat_id_needs_sync(ggml_backend_sycl_context * ctx, con
 // mirrors the paths in ggml_sycl_mul_mat_id() that call opt_for_reorder_id()
 static bool mul_mat_id_reorders_src0(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
-    if (ggml_sycl_mul_mat_id_should_use_mmvq(dst) || src0->type == GGML_TYPE_MXFP4) {
+    if (ggml_sycl_mul_mat_id_should_use_mmvq(dst) || ggml_sycl_mul_mat_id_mc_eligible(dst) ||
+        src0->type == GGML_TYPE_MXFP4) {
         return true;
     }
     return ggml_sycl_mul_mat_id_device_sched_eligible(dst) &&
@@ -7059,6 +8793,10 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
 #endif
                 break;
             case GGML_OP_OUT_PROD:
+                if (ggml_sycl_out_prod_direct(node)) {
+                    break;
+                }
+                [[fallthrough]];
             case GGML_OP_CONV_3D:
             case GGML_OP_SOLVE_TRI:
                 // these call oneMKL and wait on the host
@@ -7077,6 +8815,10 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     // set the device on every call: a graph replay does not go through
     // ggml_backend_sycl_graph_compute_impl()
     ggml_sycl_set_main_device(sycl_ctx->device);
+#if GGML_SYCL_DNNL
+    // the packed weights of the fused gate kernel, before anything runs or records (see gate-mix-mm.hpp)
+    ggml_sycl_gate_mix_mm_prepare(*sycl_ctx, cgraph);
+#endif
 
 #ifdef GGML_SYCL_GRAPH
     bool              use_sycl_graph = false;
@@ -7404,6 +9146,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                     // the fused GLU kernels only have f32/f16 instantiations
                     return ggml_is_contiguous_1(op->src[0]) &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                case GGML_GLU_OP_SITU:
+                    return ggml_sycl_situ_supported(op);
                 default:
                     return false;
             }
@@ -7663,6 +9407,12 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_L2_NORM:
         case GGML_OP_GROUP_NORM:
             return true;
+        case GGML_OP_L2_CLIP:
+            return ggml_sycl_l2_clip_supported(op);
+        case GGML_OP_GATE_MIX:
+            return ggml_sycl_gate_mix_supported(op);
+        case GGML_OP_GATE_MIX_MV:
+            return ggml_sycl_gate_mix_mv_supported(op);
         case GGML_OP_RMS_NORM:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_RMS_NORM_BACK:
@@ -7753,6 +9503,12 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_SSM_CONV_HIST:
+            return ggml_sycl_ssm_conv_hist_supported(op);
+        case GGML_OP_BLOCK_MIX:
+            return ggml_sycl_block_mix_supported(op);
+        case GGML_OP_REL_BIAS:
+            return ggml_sycl_rel_bias_supported(op);
         case GGML_OP_ROLL:
             return op->type == GGML_TYPE_F32;
         case GGML_OP_ARANGE:
@@ -7777,8 +9533,10 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
-            // K/V row lists and indexed bias are not supported
-            return op->src[5] == nullptr && !ggml_flash_attn_ext_has_indexed_bias(op) && ggml_sycl_flash_attn_ext_supported(device, op);
+            // K/V row lists and the indexed bias added to a mask are not supported, the one in place of the mask
+            // (ggml_flash_attn_ext_set_rel_bias) is
+            return op->src[5] == nullptr && (!ggml_flash_attn_ext_has_indexed_bias(op) || ggml_flash_attn_ext_has_rel_bias(op)) &&
+                   ggml_sycl_flash_attn_ext_supported(device, op);
         default:
             return false;
     }

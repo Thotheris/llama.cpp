@@ -1,6 +1,8 @@
 #include "norm.hpp"
 
 #include "fusion.hpp"
+#include "gate-mix.hpp"
+#include "dense-dnn.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
 
@@ -394,12 +396,229 @@ static void group_norm_f32_sycl(const float* x, float* dst,
     }
 }
 
+// Fast path of the RMS norms for contiguous float4 rows (ncols % 4 == 0, every row 16-byte aligned): one
+// work-group of W work-items per row, each work-item keeps its R float4 units (e = tid + r*W) in registers, so
+// the row is read once; the squares are summed per work-item, per sub-group, then the sub-group partials in a
+// fixed order by every work-item (one barrier, deterministic). W is sized to the row (2304 floats: 192 x 3), so
+// many work-groups share an Xe core instead of one 1024-wide group per row stalling on its barrier.
+struct rms_norm_vec_args {
+    const float * x;   int64_t s01, s02, s03;
+    float *       dst; int64_t d01, d02, d03;
+    const float * mul; int64_t m01, m02, m03; int mnr, mnc, mns;
+    const float * add; int64_t a01, a02, a03; int anr, anc, ans;
+    int   ncols;
+    float eps;
+    float scale_mul;
+    // GATE: the row is GATE_MIX(x, gm, gg) (x as above), computed in registers instead of read
+    const float * gm;  int64_t gm1, gm2, gm3;
+    const float * gg;  int64_t gg1, gg2, gg3;
+    bool  tanh_gates;
+    // GH (with GATE): the gains|forgets as dense f16 rows of 2*ncols instead of gg, tanh already applied
+    const sycl::half * gh;
+    // F16OUT: also a dense f16 copy of the result, row-major over (sample, channel, row)
+    sycl::half *  dst_h;
+    // F16OUT: the f16 copy only, the f32 result is not written (GGML_SYCL_DROP_F32: only the dense matmuls read it)
+    bool          no_f32;
+};
+
+constexpr int RMS_VEC_MAX_SG = 1024 / WARP_SIZE;
+
+template <int R, bool do_multiply, bool do_add, bool do_scale, bool GATE = false, bool F16OUT = false, bool GH = false>
+static void rms_norm_f32_vec(const rms_norm_vec_args p, const sycl::nd_item<3> & it, float * s_sum) {
+    const int sample  = it.get_group(0);
+    const int channel = it.get_group(1);
+    const int row     = it.get_group(2);
+    const int W       = it.get_local_range(2);
+    const int tid     = it.get_local_id(2);
+    const auto sg     = it.get_sub_group();
+    const int n_sg    = W / WARP_SIZE;
+    const int nv      = p.ncols / 4;
+
+    const sycl::float4 * x = (const sycl::float4 *) (p.x + sample*p.s03 + channel*p.s02 + row*p.s01);
+    sycl::float4 *       y = (sycl::float4 *)       (p.dst + sample*p.d03 + channel*p.d02 + row*p.d01);
+
+    sycl::float4 v[R];
+    float ss = 0.0f;
+    [[maybe_unused]] const sycl::float4 * gmr = nullptr;
+    [[maybe_unused]] const float *        ggr = nullptr;
+    [[maybe_unused]] const sycl::half *   ghr = nullptr;
+    if constexpr (GATE) {
+        gmr = (const sycl::float4 *) (p.gm + sample*p.gm3 + channel*p.gm2 + row*p.gm1);
+        if constexpr (GH) {
+            const int64_t rr = ((int64_t) sample*it.get_group_range(1) + channel)*it.get_group_range(2) + row;
+            ghr = p.gh + rr*2*p.ncols;
+        } else {
+            ggr = p.gg + sample*p.gg3 + channel*p.gg2 + row*p.gg1;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int e = tid + r*W;
+        v[r] = e < nv ? x[e] : sycl::float4(0.0f);
+        if constexpr (GATE) {
+            // the arithmetic of gate_mix_f32_sycl (gate-mix.cpp) per component: (x - forget*x) + gain*m
+            if (e < nv) {
+                const sycl::float4 mv = gmr[e];
+                sycl::float4 gain, forget;
+                if constexpr (GH) {
+                    gain   = ((const sycl::vec<sycl::half, 4> *) ghr)[e].template convert<float>();
+                    forget = ((const sycl::vec<sycl::half, 4> *) (ghr + p.ncols))[e].template convert<float>();
+                } else {
+                    gain   = ((const sycl::float4 *) ggr)[e];
+                    forget = ((const sycl::float4 *) (ggr + p.ncols))[e];
+                }
+                if (!GH && p.tanh_gates) {
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        gain[k]   = sycl::tanh(gain[k]);
+                        forget[k] = sycl::tanh(forget[k]);
+                    }
+                }
+                const sycl::float4 fx = forget * v[r];
+                const sycl::float4 a  = v[r] - fx;
+                const sycl::float4 gm = gain * mv;
+                v[r] = a + gm;
+            }
+        }
+        ss += (v[r].x()*v[r].x() + v[r].y()*v[r].y()) + (v[r].z()*v[r].z() + v[r].w()*v[r].w());
+    }
+    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+    if (n_sg > 1) {
+        if (sg.leader()) {
+            s_sum[sg.get_group_linear_id()] = ss;
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        ss = 0.0f;
+        for (int i = 0; i < n_sg; ++i) {
+            ss += s_sum[i];
+        }
+    }
+    const float mean  = ss / p.ncols;
+    const float scale = sycl::rsqrt(mean + p.eps);
+
+    const sycl::float4 * m = nullptr;
+    const sycl::float4 * a = nullptr;
+    if constexpr (do_multiply) {
+        m = (const sycl::float4 *) (p.mul + (sample % p.mns)*p.m03 + (channel % p.mnc)*p.m02 + (row % p.mnr)*p.m01);
+    }
+    if constexpr (do_add) {
+        a = (const sycl::float4 *) (p.add + (sample % p.ans)*p.a03 + (channel % p.anc)*p.a02 + (row % p.anr)*p.a01);
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int e = tid + r*W;
+        if (e < nv) {
+            // the float order of the scalar kernel: scale*x, then *mul, then +add (or *scale_mul)
+            sycl::float4 o = scale*v[r];
+            if constexpr (do_multiply) {
+                o = o*m[e];
+            }
+            if constexpr (do_add) {
+                o = o + a[e];
+            }
+            if constexpr (do_scale) {
+                o = o*p.scale_mul;
+            }
+            if (!F16OUT || !p.no_f32) {
+                y[e] = o;
+            }
+            if constexpr (F16OUT) {
+                // the conversion of the oneDNN f32 -> f16 reorder: round to nearest even
+                const int64_t rr = ((int64_t) sample*it.get_group_range(1) + channel)*it.get_group_range(2) + row;
+                ((sycl::vec<sycl::half, 4> *) (p.dst_h + rr*p.ncols))[e] =
+                    o.template convert<sycl::half, sycl::rounding_mode::rte>();
+            }
+        }
+    }
+}
+
+template <int R, bool do_multiply, bool do_add, bool do_scale, bool GATE = false, bool F16OUT = false, bool GH = false>
+static void rms_norm_vec_launch(const rms_norm_vec_args & p, int nrows, int nchannels, int nsamples, int W, queue_ptr stream) {
+    const sycl::range<3> global_dims(nsamples, nchannels, nrows);
+    const sycl::range<3> block_dims(1, 1, W);
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> s_sum(sycl::range<1>(RMS_VEC_MAX_SG), cgh);
+        cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
+            [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                rms_norm_f32_vec<R, do_multiply, do_add, do_scale, GATE, F16OUT, GH>(p, it,
+                    s_sum.get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+    });
+}
+
+// the units per work-item R of the fast path, 0 when the rows do not qualify (the caller runs the scalar kernel)
+static int rms_norm_vec_units(const rms_norm_vec_args & p, int64_t src_stride_col, int64_t dst_stride_col,
+                              bool do_multiply, bool do_add, bool gate, bool f16out) {
+    static const bool disabled = getenv("GGML_SYCL_RMS_NORM_VEC") && atoi(getenv("GGML_SYCL_RMS_NORM_VEC")) == 0;
+    auto al = [](const void * ptr) { return ((uintptr_t) ptr % 16) == 0; };
+    if (disabled || src_stride_col != 1 || dst_stride_col != 1 || p.ncols % 4 != 0 || p.ncols > 8*1024*4 ||
+        !al(p.x) || !al(p.dst) || (p.s01 | p.s02 | p.s03 | p.d01 | p.d02 | p.d03) % 4 != 0) {
+        return 0;
+    }
+    if (do_multiply && (!al(p.mul) || (p.m01 | p.m02 | p.m03) % 4 != 0)) {
+        return 0;
+    }
+    if (do_add && (!al(p.add) || (p.a01 | p.a02 | p.a03) % 4 != 0)) {
+        return 0;
+    }
+    if (gate && (!al(p.gm) || !al(p.gg) || (p.gm1 | p.gm2 | p.gm3 | p.gg1 | p.gg2 | p.gg3) % 4 != 0)) {
+        return 0;
+    }
+    if (f16out && ((uintptr_t) p.dst_h % 8) != 0) {
+        return 0;
+    }
+    const int nv = p.ncols / 4;
+    // the fewest units per work-item that keep the group at most 256 wide, then the group sized to the row
+    int R = 1;
+    while (R < 8 && (nv + R - 1) / R > 256) {
+        R = R < 4 ? R + 1 : R + 2;
+    }
+    if ((nv + R - 1) / R > 1024) {
+        return 0;
+    }
+    return R;
+}
+
+template <bool do_multiply, bool do_add, bool do_scale, bool GATE = false, bool F16OUT = false, bool GH = false>
+static void rms_norm_vec_run(const rms_norm_vec_args & p, int R, int nrows, int nchannels, int nsamples, queue_ptr stream) {
+    const int nv = p.ncols / 4;
+    const int W  = (int) GGML_PAD((nv + R - 1) / R, WARP_SIZE);
+    switch (R) {
+        case 1: rms_norm_vec_launch<1, do_multiply, do_add, do_scale, GATE, F16OUT, GH>(p, nrows, nchannels, nsamples, W, stream); break;
+        case 2: rms_norm_vec_launch<2, do_multiply, do_add, do_scale, GATE, F16OUT, GH>(p, nrows, nchannels, nsamples, W, stream); break;
+        case 3: rms_norm_vec_launch<3, do_multiply, do_add, do_scale, GATE, F16OUT, GH>(p, nrows, nchannels, nsamples, W, stream); break;
+        case 4: rms_norm_vec_launch<4, do_multiply, do_add, do_scale, GATE, F16OUT, GH>(p, nrows, nchannels, nsamples, W, stream); break;
+        case 6: rms_norm_vec_launch<6, do_multiply, do_add, do_scale, GATE, F16OUT, GH>(p, nrows, nchannels, nsamples, W, stream); break;
+        default: rms_norm_vec_launch<8, do_multiply, do_add, do_scale, GATE, F16OUT, GH>(p, nrows, nchannels, nsamples, W, stream); break;
+    }
+}
+
+// false when the rows do not qualify (the caller runs the scalar kernel)
+template <bool do_multiply, bool do_add, bool do_scale>
+static bool rms_norm_vec_try(const rms_norm_vec_args & p, int64_t src_stride_col, int64_t dst_stride_col,
+                             int nrows, int nchannels, int nsamples, queue_ptr stream) {
+    const int R = rms_norm_vec_units(p, src_stride_col, dst_stride_col, do_multiply, do_add, false, false);
+    if (R == 0) {
+        return false;
+    }
+    rms_norm_vec_run<do_multiply, do_add, do_scale>(p, R, nrows, nchannels, nsamples, stream);
+    return true;
+}
+
 static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
     const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
     const float eps, queue_ptr stream, int device) {
     // printf("%s ncols=%d, nrows=%d, WARP_SIZE=%d\n", __func__, ncols, nrows, WARP_SIZE);
 
+    {
+        const rms_norm_vec_args p = { x, src_stride_row, src_stride_channel, src_stride_sample,
+            dst, dst_stride_row, dst_stride_channel, dst_stride_sample,
+            nullptr, 0, 0, 0, 1, 1, 1, nullptr, 0, 0, 0, 1, 1, 1, ncols, eps, 1.0f, nullptr, 0, 0, 0, nullptr, 0, 0, 0, false, nullptr, nullptr, false };
+        if (rms_norm_vec_try<false, false, false>(p, src_stride_col, dst_stride_col, nrows, nchannels, nsamples, stream)) {
+            return;
+        }
+    }
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
@@ -445,6 +664,14 @@ static void rms_norm_scale_f32_sycl(const float* x, float* dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
     const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
     const float eps, const float scale_mul, queue_ptr stream, int device) {
+    {
+        const rms_norm_vec_args p = { x, src_stride_row, src_stride_channel, src_stride_sample,
+            dst, dst_stride_row, dst_stride_channel, dst_stride_sample,
+            nullptr, 0, 0, 0, 1, 1, 1, nullptr, 0, 0, 0, 1, 1, 1, ncols, eps, scale_mul, nullptr, 0, 0, 0, nullptr, 0, 0, 0, false, nullptr, nullptr, false };
+        if (rms_norm_vec_try<false, false, true>(p, src_stride_col, dst_stride_col, nrows, nchannels, nsamples, stream)) {
+            return;
+        }
+    }
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
@@ -493,6 +720,15 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
         const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
         const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
         const float eps, queue_ptr stream, int device) {
+    {
+        const rms_norm_vec_args p = { x, src_stride_row, src_stride_channel, src_stride_sample,
+            dst, dst_stride_row, dst_stride_channel, dst_stride_sample,
+            mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+            nullptr, 0, 0, 0, 1, 1, 1, ncols, eps, 1.0f, nullptr, 0, 0, 0, nullptr, 0, 0, 0, false, nullptr, nullptr, false };
+        if (rms_norm_vec_try<true, false, false>(p, src_stride_col, dst_stride_col, nrows, nchannels, nsamples, stream)) {
+            return;
+        }
+    }
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
@@ -538,6 +774,16 @@ static void rms_norm_mul_add_f32_sycl(const float* x, const float* mul, const fl
         const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
         const int add_nrows, const int add_nchannels, const int add_nsamples,
         const float eps, queue_ptr stream, int device) {
+    {
+        const rms_norm_vec_args p = { x, src_stride_row, src_stride_channel, src_stride_sample,
+            dst, dst_stride_row, dst_stride_channel, dst_stride_sample,
+            mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+            add, add_stride_row, add_stride_channel, add_stride_sample, add_nrows, add_nchannels, add_nsamples,
+            ncols, eps, 1.0f, nullptr, 0, 0, 0, nullptr, 0, 0, 0, false, nullptr, nullptr, false };
+        if (rms_norm_vec_try<true, true, false>(p, src_stride_col, dst_stride_col, nrows, nchannels, nsamples, stream)) {
+            return;
+        }
+    }
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
@@ -872,6 +1118,123 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     rms_norm_mul_f32_sycl(src0_dd, mul_dd, dst_dd, ne00, ne01, ne02, ne03,
         s00, s01, s02, s03, d00, d01, d02, d03,
         mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples, eps, main_stream, ctx.device);
+}
+
+// [GATE_MIX ->] RMS_NORM -> MUL(weight) on the fast path, optionally with the f16 copy for the dense matmuls;
+// false (nothing queued) when it does not qualify
+static bool rms_norm_mul_fast(ggml_backend_sycl_context & ctx, const ggml_tensor * gate_mix, const ggml_tensor * rms,
+                              ggml_tensor * mul_tensor, bool f16_for_dense, const sycl::half * gates_h = nullptr,
+                              bool check_only = false, int pin_until = -1) {
+    const ggml_tensor * xs = gate_mix ? gate_mix->src[0] : rms->src[0];
+    if ((gate_mix && (!ggml_sycl_gate_mix_supported(gate_mix) || rms->src[0] != gate_mix)) ||
+        xs->type != GGML_TYPE_F32 || xs->nb[0] != sizeof(float) || !ggml_are_same_shape(xs, rms) ||
+        rms->type != GGML_TYPE_F32 || mul_tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * w = mul_tensor->src[0] == rms ? mul_tensor->src[1] : mul_tensor->src[0];
+    if ((mul_tensor->src[0] != rms && mul_tensor->src[1] != rms) || w->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(mul_tensor, rms) || w->ne[0] != rms->ne[0] || w->nb[0] != sizeof(float) ||
+        mul_tensor->nb[0] != sizeof(float) || !ggml_can_repeat(w, rms)) {
+        return false;
+    }
+    for (const ggml_tensor * t : { xs, (const ggml_tensor *) mul_tensor, w }) {
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % sizeof(float) != 0) {
+                return false;
+            }
+        }
+    }
+    if (ggml_nrows(rms) == 0 || rms->ne[0] == 0) {
+        return false;
+    }
+
+    float eps = 0.0f;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    constexpr size_t ts = sizeof(float);
+
+    rms_norm_vec_args p = {};
+    p.x   = (const float *) xs->data; p.s01 = xs->nb[1] / ts; p.s02 = xs->nb[2] / ts; p.s03 = xs->nb[3] / ts;
+    p.dst = (float *) mul_tensor->data;
+    p.d01 = mul_tensor->nb[1] / ts; p.d02 = mul_tensor->nb[2] / ts; p.d03 = mul_tensor->nb[3] / ts;
+    p.mul = (const float *) w->data;  p.m01 = w->nb[1] / ts; p.m02 = w->nb[2] / ts; p.m03 = w->nb[3] / ts;
+    p.mnr = w->ne[1]; p.mnc = w->ne[2]; p.mns = w->ne[3];
+    p.anr = 1; p.anc = 1; p.ans = 1;
+    p.ncols     = (int) rms->ne[0];
+    p.eps       = eps;
+    p.scale_mul = 1.0f;
+    if (gate_mix) {
+        const ggml_tensor * m = gate_mix->src[1];
+        const ggml_tensor * g = gate_mix->src[2];
+        p.gm  = (const float *) m->data; p.gm1 = m->nb[1] / ts; p.gm2 = m->nb[2] / ts; p.gm3 = m->nb[3] / ts;
+        p.gg  = (const float *) g->data; p.gg1 = g->nb[1] / ts; p.gg2 = g->nb[2] / ts; p.gg3 = g->nb[3] / ts;
+        p.tanh_gates = ggml_get_op_params_i32(gate_mix, 0) != 0;
+    }
+
+    const int R = rms_norm_vec_units(p, 1, 1, true, false, gate_mix != nullptr, false);
+    if (R == 0) {
+        return false;
+    }
+    if (check_only) {
+        return true;
+    }
+    p.gh = gates_h;
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+#if GGML_SYCL_DNNL
+    // the f16 copy the dense oneDNN matmuls read, written here instead of converted from the f32 result (the
+    // slot is registered only now that the kernel is sure to run)
+    // pin_until >= 0: the f16 copy is pinned in the cache until that node, and the f32 result is not written
+    if (f16_for_dense) {
+        p.dst_h = ggml_sycl_dense_dnn_act_reserve(ctx, mul_tensor, pin_until);
+        if (!p.dst_h && pin_until >= 0) {
+            p.dst_h = ggml_sycl_dense_dnn_act_reserve(ctx, mul_tensor);
+        } else {
+            p.no_f32 = p.dst_h && pin_until >= 0;
+        }
+    }
+#else
+    GGML_UNUSED(f16_for_dense);
+    GGML_UNUSED(pin_until);
+#endif
+    const int nr = (int) rms->ne[1], nc = (int) rms->ne[2], ns = (int) rms->ne[3];
+    queue_ptr q  = ctx.stream();
+    if (gate_mix && gates_h) {
+        if (p.dst_h) {
+            rms_norm_vec_run<true, false, false, true, true, true>(p, R, nr, nc, ns, q);
+        } else {
+            rms_norm_vec_run<true, false, false, true, false, true>(p, R, nr, nc, ns, q);
+        }
+    } else if (gate_mix) {
+        if (p.dst_h) {
+            rms_norm_vec_run<true, false, false, true, true>(p, R, nr, nc, ns, q);
+        } else {
+            rms_norm_vec_run<true, false, false, true, false>(p, R, nr, nc, ns, q);
+        }
+    } else {
+        if (p.dst_h) {
+            rms_norm_vec_run<true, false, false, false, true>(p, R, nr, nc, ns, q);
+        } else {
+            rms_norm_vec_run<true, false, false, false, false>(p, R, nr, nc, ns, q);
+        }
+    }
+    return true;
+}
+
+bool ggml_sycl_op_gate_mix_rms_norm_mul(ggml_backend_sycl_context & ctx, ggml_tensor * gate_mix, ggml_tensor * rms,
+                                        ggml_tensor * mul_tensor, bool f16_for_dense, const sycl::half * gates_h,
+                                        bool check_only, int pin_until) {
+    static const bool disabled = getenv("GGML_SYCL_GATE_MIX_NORM") && atoi(getenv("GGML_SYCL_GATE_MIX_NORM")) == 0;
+    if (gates_h || check_only) {
+        // the f16 gates hold tanh(gain|forget): only for a mix that applies the tanh
+        if (!gate_mix || ggml_get_op_params_i32(gate_mix, 0) == 0) {
+            return false;
+        }
+    }
+    return !disabled && rms_norm_mul_fast(ctx, gate_mix, rms, mul_tensor, f16_for_dense, gates_h, check_only, pin_until);
+}
+
+bool ggml_sycl_op_rms_norm_mul_f16(ggml_backend_sycl_context & ctx, ggml_tensor * rms, ggml_tensor * mul_tensor,
+                                   int pin_until) {
+    return rms_norm_mul_fast(ctx, nullptr, rms, mul_tensor, true, nullptr, false, pin_until);
 }
 
 void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tensor * dst,

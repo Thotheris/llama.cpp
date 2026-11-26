@@ -98,6 +98,7 @@ enum ggml_sycl_xmx_gather_type {
     GGML_SYCL_XMX_GATHER_Q6_K     = 1 << 12,
     GGML_SYCL_XMX_GATHER_Q2_K     = 1 << 13,
     GGML_SYCL_XMX_GATHER_Q3_K     = 1 << 14,
+    GGML_SYCL_XMX_GATHER_Q5_0     = 1 << 15,
 };
 static constexpr int GGML_SYCL_XMX_GATHER_TYPES_DEFAULT = ~0;
 extern int g_ggml_sycl_xmx_gather_types;
@@ -271,9 +272,11 @@ static inline bool ggml_sycl_xmx_supports_arch(gpu_arch arch) {
            arch == gpu_arch::intel_gpu_lnl_m;
 }
 
-// fewest columns for which the XMX kernel is faster than the other kernels
+// fewest columns for which the XMX kernel is faster than the other kernels. A one-column Q4_K product goes to the
+// reordered DMMV kernel: it reads the f32 activations, so it also saves the q8_1 quantize kernel the XMX path needs
+// (decode with ~190 such products a token: 8.8 us XMX + 1.4 us quantize against 9.4 us DMMV).
 static inline int ggml_sycl_xmx_min_cols(ggml_type type) {
-    return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ? 1 : 2;
+    return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K ? 1 : 2;
 }
 
 static int g_all_sycl_device_count = -1;
@@ -499,6 +502,11 @@ struct sdpa_partition {
 };
 #endif
 
+#if GGML_SYCL_DNNL
+struct ggml_sycl_dense_dnn_ctx;
+void ggml_sycl_dense_dnn_ctx_free(ggml_sycl_dense_dnn_ctx * state);
+#endif
+
 struct ggml_backend_sycl_context {
     int device;
     std::string name;
@@ -569,7 +577,18 @@ struct ggml_backend_sycl_context {
     }
 
     std::unordered_map<std::string, sdpa_partition> sdpa_partitions;
+
+    // dense-dnn.cpp: converted activations and primitive caches of the dense oneDNN matmul
+    ggml_sycl_dense_dnn_ctx * dense_dnn = nullptr;
 #endif
+
+    ggml_backend_sycl_context(const ggml_backend_sycl_context &) = delete;
+    ggml_backend_sycl_context & operator=(const ggml_backend_sycl_context &) = delete;
+    ~ggml_backend_sycl_context() {
+#if GGML_SYCL_DNNL
+        ggml_sycl_dense_dnn_ctx_free(dense_dnn);
+#endif
+    }
 
     // pool
     std::unique_ptr<ggml_sycl_pool> pools[GGML_SYCL_MAX_DEVICES];

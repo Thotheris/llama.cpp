@@ -1,5 +1,8 @@
 #include "server-context.h"
 #include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include "base64.hpp"
 #include "server-chat.h"
@@ -3435,6 +3438,94 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
+    // samples the slots of one decode on several threads (LLAMA_SERVER_SAMPLE_THREADS, default 8, 1 = serial)
+    // each slot has its own sampler, so the sampled tokens are the same as when the slots are sampled one by one
+    struct sample_pool {
+        std::vector<std::thread> workers;
+        std::mutex               mtx;
+        std::condition_variable  cv_work;
+        std::condition_variable  cv_done;
+        std::function<void(int)> job;
+        std::atomic<int>         next{0};
+        int                      n_jobs    = 0;
+        int                      n_active  = 0;
+        uint64_t                 gen       = 0;
+        bool                     stop      = false;
+
+        explicit sample_pool(int n_threads) {
+            for (int i = 0; i < n_threads - 1; ++i) {
+                workers.emplace_back([this]() {
+                    uint64_t seen = 0;
+                    while (true) {
+                        {
+                            std::unique_lock<std::mutex> lock(mtx);
+                            cv_work.wait(lock, [&]() { return stop || gen != seen; });
+                            if (stop) {
+                                return;
+                            }
+                            seen = gen;
+                        }
+                        work();
+                        {
+                            std::lock_guard<std::mutex> lock(mtx);
+                            if (--n_active == 0) {
+                                cv_done.notify_one();
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        ~sample_pool() {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                stop = true;
+            }
+            cv_work.notify_all();
+            for (auto & w : workers) {
+                w.join();
+            }
+        }
+
+        void work() {
+            for (int i = next++; i < n_jobs; i = next++) {
+                job(i);
+            }
+        }
+
+        // run f(0) .. f(n - 1) on the workers and the calling thread, return when all are done
+        void run(int n, const std::function<void(int)> & f) {
+            if (workers.empty() || n < 2) {
+                for (int i = 0; i < n; ++i) {
+                    f(i);
+                }
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                job      = f;
+                n_jobs   = n;
+                next     = 0;
+                n_active = (int) workers.size();
+                gen++;
+            }
+            cv_work.notify_all();
+            work();
+            std::unique_lock<std::mutex> lock(mtx);
+            cv_done.wait(lock, [&]() { return n_active == 0; });
+            job = nullptr;
+        }
+    };
+
+    std::unique_ptr<sample_pool> smpl_pool = std::make_unique<sample_pool>(
+            std::max(1, getenv("LLAMA_SERVER_SAMPLE_THREADS") ? atoi(getenv("LLAMA_SERVER_SAMPLE_THREADS")) : 8));
+
+    // LLAMA_SERVER_STEP_LOG=1: one stderr line per update_slots() iteration (diagnostics)
+    const bool step_log = getenv("LLAMA_SERVER_STEP_LOG") != nullptr;
+    int64_t step_t_last = 0;
+    int64_t step_t_sampl = 0;
+    int64_t step_n_sampl = 0;
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
@@ -3560,6 +3651,13 @@ private:
             }
         }
 
+        const int64_t step_t0 = ggml_time_us();
+        step_t_sampl = 0;
+        step_n_sampl = 0;
+        int64_t step_t_dec = 0;
+        int64_t step_t_post = 0;
+        int     step_n_dec = 0;
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3608,9 +3706,20 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        const int64_t step_t1 = ggml_time_us();
+        int step_n_gen = 0, step_n_pp = 0;
+        if (step_log) {
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING) step_n_gen++;
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) step_n_pp++;
+            }
+        }
+        const int step_n_tok = batch.size();
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
+            const int64_t step_td = ggml_time_us();
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
                 scoped_timer t(t_decode, n_decode);
@@ -3638,14 +3747,26 @@ private:
                 break; // stop any further processing
             }
 
+            const int64_t step_tp = ggml_time_us();
+            step_t_dec += step_tp - step_td;
+            step_n_dec++;
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off);
+                step_t_post += ggml_time_us() - step_tp;
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+        }
+
+        if (step_log) {
+            const int64_t t_end = ggml_time_us();
+            fprintf(stderr, "STEP t=%.3f gap=%.2f ntok=%d gen=%d pp=%d ndec=%d pre=%.2f dec=%.2f post=%.2f sampl=%.2f/%d\n",
+                    t_end / 1e6, step_t_last ? (step_t0 - step_t_last) / 1e3 : 0.0, step_n_tok, step_n_gen, step_n_pp, step_n_dec,
+                    (step_t1 - step_t0) / 1e3, step_t_dec / 1e3, step_t_post / 1e3, step_t_sampl / 1e3, (int) step_n_sampl);
+            step_t_last = t_end;
         }
     }
 
@@ -3817,6 +3938,16 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // no new drafts while more than LLAMA_SPEC_MAX_SLOTS (default 1; 0: no limit) slots generate: a
+        // multi-slot batch already amortizes the weights over its tokens, and the verify rows of several slots cost
+        // more than their accepted tokens save. The draft model still processes every batch (it stays in sync)
+        static const int spec_max_slots = getenv("LLAMA_SPEC_MAX_SLOTS") ? atoi(getenv("LLAMA_SPEC_MAX_SLOTS")) : 1;
+        int n_slots_generating = 0;
+        iterate(slots, [&](server_slot & slot) {
+            n_slots_generating += slot.state == SLOT_STATE_GENERATING;
+        });
+        const bool spec_slots_ok = spec_max_slots <= 0 || n_slots_generating <= spec_max_slots;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -3855,7 +3986,7 @@ private:
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
-                    } else {
+                    } else if (spec_slots_ok) {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
                         slot.spec_ckpt.update_pos(
@@ -4785,6 +4916,44 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // sample the slots that need a token from this sub-batch up front, in parallel (see sample_pool)
+        // the conditions are the ones of the loop below, which then takes the sampled token
+        std::vector<server_slot *> to_sample;
+        std::vector<llama_token>   sampled_pre(slots.size(), LLAMA_TOKEN_NULL);
+        iterate(slots, [&](server_slot & slot) {
+            if (!is_inside_view(slot.i_batch)) {
+                return;
+            }
+            if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING || slot.task->type == SERVER_TASK_TYPE_RERANK ||
+                    slot.task->type == SERVER_TASK_TYPE_DECISION  || !slot.task->need_sampling()) {
+                    return;
+                }
+            } else if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+            if (slot.can_speculate() && !slot.spec_draft.empty()) {
+                return;
+            }
+            to_sample.push_back(&slot);
+        });
+
+        if (to_sample.size() >= 2) {
+            const int64_t ts0 = step_log ? ggml_time_us() : 0;
+
+            // read the outputs on this thread (synchronizes the context), the samplers then only read memory
+            std::vector<common_sampler_output> outs(to_sample.size());
+            for (size_t i = 0; i < to_sample.size(); ++i) {
+                outs[i] = common_sampler_get_output(to_sample[i]->ctx_tgt, to_sample[i]->i_batch - off);
+            }
+
+            smpl_pool->run((int) to_sample.size(), [&](int i) {
+                sampled_pre[i] = common_sampler_sample_output(to_sample[i]->smpl.get(), outs[i]);
+            });
+
+            if (step_log) { step_t_sampl += ggml_time_us() - ts0; step_n_sampl += to_sample.size(); }
+        }
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -4843,7 +5012,15 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                const auto it = std::find(to_sample.begin(), to_sample.end(), &slot);
+                if (to_sample.size() >= 2 && it != to_sample.end()) {
+                    id = sampled_pre[it - to_sample.begin()];
+                    GGML_ASSERT(id != LLAMA_TOKEN_NULL);
+                } else {
+                    const int64_t ts0 = step_log ? ggml_time_us() : 0;
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                    if (step_log) { step_t_sampl += ggml_time_us() - ts0; step_n_sampl++; }
+                }
             }
 
             slot.i_batch = -1;

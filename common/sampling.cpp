@@ -131,30 +131,27 @@ struct common_sampler {
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
-        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
-        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
-        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+    void set_logits(const common_sampler_output & out) {
+        const float *       sampled_probs  = out.sampled_probs;
+        const float *       sampled_logits = out.sampled_logits;
+        const llama_token * sampled_ids    = out.sampled_ids;
 
-        const llama_model * model = llama_get_model(ctx);
-        const llama_vocab * vocab = llama_model_get_vocab(model);
-
-        const int n_vocab = llama_vocab_n_tokens(vocab);
+        const int n_vocab = out.n_vocab;
 
         if (sampled_probs) {
-            const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
+            const uint32_t sampled_probs_count = out.n_sampled;
             cur.resize(sampled_probs_count);
             for (uint32_t i = 0; i < sampled_probs_count; ++i) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
             }
         } else if (sampled_logits) {
-            const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
+            const uint32_t sampled_logits_count = out.n_sampled;
             cur.resize(sampled_logits_count);
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
         } else {
-            const auto * logits = llama_get_logits_ith(ctx, idx);
+            const auto * logits = out.logits;
             GGML_ASSERT(logits != nullptr);
             cur.resize(n_vocab);
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
@@ -163,6 +160,10 @@ struct common_sampler {
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    void set_logits(struct llama_context * ctx, int idx) {
+        set_logits(common_sampler_get_output(ctx, idx));
     }
 
     common_time_meas tm() {
@@ -611,9 +612,35 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+common_sampler_output common_sampler_get_output(struct llama_context * ctx, int idx) {
+    common_sampler_output out;
+
+    out.sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+    out.sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+    out.sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+
+    out.n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+
+    if (out.sampled_probs) {
+        out.n_sampled = llama_get_sampled_probs_count_ith(ctx, idx);
+    } else if (out.sampled_logits) {
+        out.n_sampled = llama_get_sampled_logits_count_ith(ctx, idx);
+    } else {
+        out.logits = llama_get_logits_ith(ctx, idx);
+    }
+
+    out.sampled = llama_get_sampled_token_ith(ctx, idx);
+
+    return out;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
+    return common_sampler_sample_output(gsmpl, common_sampler_get_output(ctx, idx), grammar_first);
+}
+
+llama_token common_sampler_sample_output(struct common_sampler * gsmpl, const common_sampler_output & out, bool grammar_first) {
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
 
@@ -624,12 +651,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    gsmpl->set_logits(out);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
-        id = llama_get_sampled_token_ith(ctx, idx);
+        id = out.sampled;
 
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
@@ -678,7 +705,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    gsmpl->set_logits(out);
 
     llama_sampler_apply(rbudget,  &cur_p);
 

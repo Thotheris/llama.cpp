@@ -67,6 +67,24 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// the outputs of one row of the last decode, as read by common_sampler_sample()
+struct common_sampler_output {
+    const float       * sampled_probs  = nullptr; // backend sampling: candidates with probabilities
+    const float       * sampled_logits = nullptr; // backend sampling: candidates with logits
+    const llama_token * sampled_ids    = nullptr;
+    uint32_t            n_sampled      = 0;
+    const float       * logits         = nullptr; // else: the logits of the whole vocabulary
+    int32_t             n_vocab        = 0;
+    llama_token         sampled        = LLAMA_TOKEN_NULL; // a token selected by a backend sampler
+};
+
+// read the outputs of row idx (synchronizes the context)
+common_sampler_output common_sampler_get_output(struct llama_context * ctx, int idx);
+
+// common_sampler_sample() on outputs read before: it does not touch the context, so that several samplers can
+// sample the rows of one decode on different threads
+llama_token common_sampler_sample_output(struct common_sampler * gsmpl, const common_sampler_output & out, bool grammar_first = false);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match

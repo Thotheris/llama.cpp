@@ -1319,6 +1319,11 @@ struct cmd_params_instance {
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
+        // the recurrent rollback mode of a speculative target (measurement aid; off by default)
+        if (const char * rs = getenv("LLAMA_BENCH_N_RS_SEQ")) {
+            cparams.n_rs_seq = (uint32_t) atoi(rs);
+        }
+
         return cparams;
     }
 };

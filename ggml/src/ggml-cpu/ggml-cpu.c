@@ -1908,6 +1908,26 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_l2_norm(params, tensor);
             } break;
+        case GGML_OP_L2_CLIP:
+            {
+                ggml_compute_forward_l2_clip(params, tensor);
+            } break;
+        case GGML_OP_GATE_MIX:
+            {
+                ggml_compute_forward_gate_mix(params, tensor);
+            } break;
+        case GGML_OP_BLOCK_MIX:
+            {
+                ggml_compute_forward_block_mix(params, tensor);
+            } break;
+        case GGML_OP_GATE_MIX_MV:
+            {
+                ggml_compute_forward_gate_mix_mv(params, tensor);
+            } break;
+        case GGML_OP_REL_BIAS:
+            {
+                ggml_compute_forward_rel_bias(params, tensor);
+            } break;
         case GGML_OP_MUL_MAT:
             {
                 ggml_compute_forward_mul_mat(params, tensor);
@@ -2082,6 +2102,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_SSM_CONV:
             {
                 ggml_compute_forward_ssm_conv(params, tensor);
+            } break;
+        case GGML_OP_SSM_CONV_HIST:
+            {
+                ggml_compute_forward_ssm_conv_hist(params, tensor);
             } break;
         case GGML_OP_SSM_SCAN:
             {
@@ -2388,6 +2412,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
+                case GGML_GLU_OP_SITU:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2403,6 +2428,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
+        case GGML_OP_L2_CLIP:
+        case GGML_OP_GATE_MIX:
+        case GGML_OP_BLOCK_MIX:
+        case GGML_OP_GATE_MIX_MV:
+        case GGML_OP_REL_BIAS:
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
@@ -2472,6 +2502,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_CONV_HIST:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
             {

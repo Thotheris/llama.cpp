@@ -351,6 +351,11 @@ extern "C" {
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
+        GGML_OP_L2_CLIP,
+        GGML_OP_GATE_MIX,
+        GGML_OP_BLOCK_MIX,
+        GGML_OP_GATE_MIX_MV,
+        GGML_OP_REL_BIAS,
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
@@ -400,6 +405,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
+        GGML_OP_SSM_CONV_HIST,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
         GGML_OP_WIN_UNPART,
@@ -473,6 +479,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
         GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SITU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1213,6 +1220,14 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 limit);
 
+    // situ(a, b) = beta*tanh(a/beta)*sigmoid(a) * lb*tanh(b/lb)  (b passes through when lb <= 0)
+    GGML_API struct ggml_tensor * ggml_situ(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 beta,
+            float                 lb);
+
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
             struct ggml_context * ctx,
@@ -1259,6 +1274,82 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             float                 eps);
+
+    // scale each row (along ne[0]) down to an L2 norm of at most threshold, after an optional
+    // per-channel scale s that is broadcast to a (s == NULL means no scale):
+    //   y = x*s * clamp(threshold / (||x*s||_2 + 1e-6), 0, 1)
+    GGML_API struct ggml_tensor * ggml_l2_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * s,
+            float                 threshold);
+
+    // mix m into x with the gates g = [gain | forget], 2*ne0 values per row of x (x, m: same shape, ne0 values per row):
+    //   y = (x - forget*x) + gain*m, with tanh applied to gain and forget first when tanh_gates is set
+    // the same rounding as the unfused MUL, SUB, MUL, ADD (and TANH) chain
+    GGML_API struct ggml_tensor * ggml_gate_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * m,
+            struct ggml_tensor  * g,
+            bool                  tanh_gates);
+
+    // attention over a stack of states, per token t and query q with the states s = [stack rows..., cur] of t:
+    //   w = softmax_k(scale*dot(s_k, query_q)), y[:, q, t] = sum_k w_k*s_k
+    // cur: [n, 1, n_tokens], stack: [n, n_stack, n_tokens] or NULL, query: [n, n_query] -> [n, n_query, n_tokens]
+    // the same rounding as the unfused CONCAT, MUL_MAT, SOFT_MAX, OUT_PROD chain on the Vulkan backend
+    GGML_API struct ggml_tensor * ggml_block_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * stack,
+            struct ggml_tensor  * query,
+            float                 scale);
+
+    // ggml_block_mix with the row RMS norms around it in one op:
+    // - eps_in >= 0: cur is raw, the state cur is rms_norm(cur, eps_in) (each row of 1 token)
+    // - eps_out >= 0: y is replaced by rms_norm(y, eps_out), times out_w ([n] or [n, n_query]) when given
+    // - keep_raw (with eps_out >= 0): the result is [n, n_query, n_tokens, 2], plane 0 the normed y, plane 1 the raw y
+    // on the Vulkan backend the reductions follow rms_norm.comp, so the rounding is the one of the unfused ops
+    GGML_API struct ggml_tensor * ggml_block_mix_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * stack,
+            struct ggml_tensor  * query,
+            float                 scale,
+            float                 eps_in,
+            struct ggml_tensor  * out_w,
+            float                 eps_out,
+            bool                  keep_raw);
+
+    // ggml_gate_mix(x, m, w*z, true): the gates g = w*z = [gain | forget] are computed in the op
+    // x, m: [n, n_tokens] F32, w: [k, 2*n] F32, z: [k, n_tokens] F32 -> [n, n_tokens]
+    // the same rounding as the unfused MUL_MAT (mul_mat_vec), GATE_MIX chain on the Vulkan backend
+    GGML_API struct ggml_tensor * ggml_gate_mix_mv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * m,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * z);
+
+    // relative-position attention bias gathered into a mask: per token i, head h and kv cell j
+    //   v = [l2_clip(r[:, h, i], s[:, h], threshold)*tau[i]; t[h, i]; 1]
+    //   y[j, i % n_tps, h, i / n_tps] = dot(table[:, pos[j, i]], v),   n_tps = n_tokens/n_stream
+    // r: [n_rel, n_head, n_tokens], s: [n_rel, n_head] or NULL, tau: [1, 1, n_tokens] or NULL (1),
+    // t: [1, n_head, n_tokens], table: [n_rel + 2, n_cols], pos: I32 [n_kv, n_tokens] with values < n_cols
+    // -> type (F32 or F16) [n_kv, n_tps, n_head, n_stream]
+    // pos NULL: the bias of every table column, pos[j, i] = j and n_kv = n_cols (the table of ggml_flash_attn_ext_set_rel_bias)
+    // it replaces L2_CLIP, MUL(tau), CONCAT(r, t, 1), MUL_MAT(table) and the element GET_ROWS by the distances
+    GGML_API struct ggml_tensor * ggml_rel_bias(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * s,
+            float                 threshold,
+            struct ggml_tensor  * tau,
+            struct ggml_tensor  * t,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * pos,
+            int                   n_stream,
+            enum ggml_type        type);
 
     // a - x
     // b - dy
@@ -1559,6 +1650,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
+
+    // ggml_get_rows with the result in type: F32, or F16 for a F32/F16 a
+    // a row of one element with b broadcast by a zero stride gathers single elements (take along dim 1)
+    GGML_API struct ggml_tensor * ggml_get_rows_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // data
+            struct ggml_tensor  * b,  // row indices
+            enum   ggml_type      type);
 
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
@@ -2301,6 +2400,30 @@ extern "C" {
             struct ggml_tensor * table,
             struct ggml_tensor * indices);
 
+    // a hint that every query row should get the result it gets alone (a batch of one query row with the same K, V
+    // and mask), bit for bit, e.g. to verify speculative drafts exactly as they would be decoded; a backend may
+    // ignore it
+    GGML_API void ggml_flash_attn_ext_set_row_exact(
+            struct ggml_tensor * a,
+            bool                 row_exact);
+
+    // the indexed bias in a second form: a per-(query, head) F16 table gathered by a per-(query, cell) index, in place
+    // of the mask (mask must be NULL), the masked cells being the ones whose index selects a column of -inf:
+    //   mask[j, i1, h, i3] = bias[pos[j, i1 + i3*n_batch], i1, h % bias->ne[2], i3]
+    // pos:  I32 [n_kv, n_batch*ne3], values in [0, bias->ne[0])
+    // bias: F16 [n_cols, n_batch, ne32, ne3]
+    // masked_pos: the pos value whose bias entries are all -inf (a backend may skip such cells without reading the
+    // bias), or -1 if there is none
+    // bias is src[6] and pos src[7], like the table and the indices of ggml_flash_attn_ext_add_indexed_bias;
+    // ggml_flash_attn_ext_has_indexed_bias is true for both forms, ggml_flash_attn_ext_has_rel_bias for this one
+    GGML_API void ggml_flash_attn_ext_set_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * pos,
+            struct ggml_tensor * bias,
+            int32_t              masked_pos);
+
+    GGML_API bool ggml_flash_attn_ext_has_rel_bias(const struct ggml_tensor * a);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
@@ -2314,6 +2437,44 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
+
+    // ggml_ssm_conv of the window [past | x^T] without building it, and the new history as a side effect:
+    //   past  [d_conv - 1, d_inner, n_s]     the history of each sequence (any strides, nb0 == sizeof(float))
+    //   x     [d_inner, n_t, n_s]            the inputs, token-major (nb0 == sizeof(float))
+    //   c     [d_conv, d_inner]              the taps
+    //   store [d_conv - 1, d_inner, n_s, K]  NULL, or a view the last d_conv - 1 columns of the window are written to
+    //                                        (it must not overlap past or x; it is written, not returned); with
+    //                                        K > 1 (K <= n_t) slot k gets the d_conv - 1 columns that end k tokens
+    //                                        earlier (the history after token n_t - 1 - k: rollback snapshots)
+    // result [d_inner, n_t, n_s], each element the same sum in the same order as ggml_ssm_conv
+    GGML_API struct ggml_tensor * ggml_ssm_conv_hist(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * store);
+
+    // ggml_ssm_conv_hist, then optionally y += add ([d_inner, n_t, n_s], nb0 == sizeof(float)) and a row post-op
+    // over each group of `group` channels of one token, the same values as the unfused ops:
+    //   GGML_SSM_CONV_POST_NONE
+    //   GGML_SSM_CONV_POST_L2_CLIP   ggml_l2_clip(y as [group, d_inner/group, ...], NULL, param)
+    //   GGML_SSM_CONV_POST_RMS_NORM  ggml_rms_norm(y as [group, d_inner/group, ...], param)
+    enum ggml_ssm_conv_post {
+        GGML_SSM_CONV_POST_NONE     = 0,
+        GGML_SSM_CONV_POST_L2_CLIP  = 1,
+        GGML_SSM_CONV_POST_RMS_NORM = 2,
+    };
+
+    GGML_API struct ggml_tensor * ggml_ssm_conv_hist_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * store,
+            struct ggml_tensor  * add,
+            enum ggml_ssm_conv_post post,
+            float                 param,
+            int                   group);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,

@@ -54,10 +54,33 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
         auto & l = loop_layers[il - core_start];
         // the q, k, v and ffn message queries
         l.msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", il), {n_embd, LOOP_CTRL_COUNT}, 0);
+        // the q, k and v controllers read the same kind of gate input: their down projections stacked, one batched
+        // matrix-vector product at decode
+        const bool qkv_stacked = plan_concat_rows(ml, {
+                    { tn(down[LOOP_CTRL_Q], "weight", il).str(), rank },
+                    { tn(down[LOOP_CTRL_K], "weight", il).str(), rank },
+                    { tn(down[LOOP_CTRL_V], "weight", il).str(), rank },
+                }, 2*n_embd, format("blk.%u.loop_ctrl_down_qkv.weight", il), &l.ctrl_down_qkv, &l.msg_query);
+        // and their [gain | forget] projections, one batched GATE_MIX_MV at decode
+        const bool gf_qkv_stacked = plan_concat_rows(ml, {
+                    { tn(gain[LOOP_CTRL_Q],   "weight", il).str(), n_embd },
+                    { tn(forget[LOOP_CTRL_Q], "weight", il).str(), n_embd },
+                    { tn(gain[LOOP_CTRL_K],   "weight", il).str(), n_embd },
+                    { tn(forget[LOOP_CTRL_K], "weight", il).str(), n_embd },
+                    { tn(gain[LOOP_CTRL_V],   "weight", il).str(), n_embd },
+                    { tn(forget[LOOP_CTRL_V], "weight", il).str(), n_embd },
+                }, rank, format("blk.%u.loop_ctrl_gain_forget_qkv.weight", il), &l.ctrl_gain_forget_qkv, &l.msg_query);
         for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
-            l.ctrl_down[c]   = create_tensor(tn(down[c],   "weight", il), {2*n_embd, rank}, 0);
-            l.ctrl_gain[c]   = create_tensor(tn(gain[c],   "weight", il), {rank, n_embd}, 0);
-            l.ctrl_forget[c] = create_tensor(tn(forget[c], "weight", il), {rank, n_embd}, 0);
+            // gain and forget project the same gate: stacked when they can be, else loaded separately
+            const bool stacked = (gf_qkv_stacked && c != LOOP_CTRL_FFN) || plan_concat_rows(ml, {
+                        { tn(gain[c],   "weight", il).str(), n_embd },
+                        { tn(forget[c], "weight", il).str(), n_embd },
+                    }, rank, format("blk.%u.loop_ctrl_gain_forget.%d.weight", il, c), &l.ctrl_gain_forget[c], &l.msg_query);
+            const int flags = stacked ? TENSOR_SKIP : 0;
+
+            l.ctrl_down[c]   = create_tensor(tn(down[c],   "weight", il), {2*n_embd, rank}, qkv_stacked && c != LOOP_CTRL_FFN ? TENSOR_SKIP : 0);
+            l.ctrl_gain[c]   = create_tensor(tn(gain[c],   "weight", il), {rank, n_embd}, flags);
+            l.ctrl_forget[c] = create_tensor(tn(forget[c], "weight", il), {rank, n_embd}, flags);
         }
     }
 }
@@ -81,11 +104,8 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     auto * cur = build_inputs();
     std::vector<ggml_tensor *> blocks;
 
-    // DSpark target features are indexed by layer visit, not by cache slot
-    int visit = 0;
-
+    // DSpark target features are indexed by layer visit, not by cache slot (build_layer taps each visit)
     for (int il = 0; il < start; ++il) {
-        res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
 
@@ -104,20 +124,25 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         }
         for (int ip = start; ip < end; ++ip) {
             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
-            res->t_layer_inp[visit++] = cur;
-            if (pass == 0) {
+                if (pass == 0) {
                 cur = build_layer(il, ip, cur, blocks);
                 continue;
             }
             const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            if (mix_fused()) {
+                // the messages and their row norms from one mix op
+                ggml_tensor * raw = nullptr;
+                ggml_tensor * nrm = mix_normed(bank, bank_out, loop.msg_query, nullptr, 1e-6f, &raw);
+                cur = build_layer(il, ip, cur, blocks, raw, &loop, nrm);
+            } else {
+                cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            }
         }
     }
 
     for (int il = end; il < m.n_phys; ++il) {
-        res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
-    GGML_ASSERT(visit == n_layer);
+    GGML_ASSERT(n_visit == n_layer);
     build_output(cur, blocks);
 }

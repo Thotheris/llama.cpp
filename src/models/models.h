@@ -4,6 +4,8 @@
 #include "llama-graph.h"
 #include "llama-model-loader.h"
 
+#include "ggml-cpp.h"
+
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
@@ -2640,10 +2642,25 @@ struct llama_model_inkling2 : public llama_model_base {
     llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void load_arch_derived() override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
+
+    // weight-only expressions made once at load, on the buffer type of their weights; looped layers share them
+    // (a graph falls back to computing them when a tensor is missing, e.g. with no_alloc)
+    struct derived_conv {
+        ggml_tensor * taps  = nullptr; // scale*(w + e_last), [n_conv, n_channels]
+        float         scale = 0.0f;
+        ggml_tensor * flip  = nullptr; // I32 n_conv - 1, ..., 0
+    };
+    struct derived_rel {
+        ggml_tensor * table = nullptr; // the relative-bias table with its constant rows and columns, [n_relative + 2, n_extent + 2]
+        ggml_tensor * sinks = nullptr; // zero sinks, [n_head]
+    };
+    std::map<const ggml_tensor *, derived_conv> derived_convs; // keyed by the convolution taps
+    std::map<const ggml_tensor *, derived_rel>  derived_rels;  // keyed by attn_rel_bias
 
     // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
     enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
@@ -2653,11 +2670,47 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * ctrl_down[LOOP_CTRL_COUNT]   = {};
         ggml_tensor * ctrl_gain[LOOP_CTRL_COUNT]   = {};
         ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
+        // rows [gain | forget], made at load; then ctrl_gain and ctrl_forget are not loaded
+        ggml_tensor * ctrl_gain_forget[LOOP_CTRL_COUNT] = {};
+        // the q, k and v down projections stacked, [2*n_embd, 3*rank]; ctrl_down[q, k, v] are then null (row views)
+        ggml_tensor * ctrl_down_qkv = nullptr;
+        // the q, k and v [gain | forget] projections stacked, [rank, 3*2*n_embd]; ctrl_gain_forget[q, k, v] are then null
+        ggml_tensor * ctrl_gain_forget_qkv = nullptr;
     };
+
+    // projections of one input stored as one row-concatenated weight, made at load: one matmul, split by views
+    // per physical layer, rows [q | gate | rel | sink] of the attention input; null when the parts cannot be stacked
+    std::vector<ggml_tensor *> attn_in;
+    // per physical full-attention layer, the q, k and v input norm weights as rows [n_embd, 3]; null when not stacked
+    std::vector<ggml_tensor *> attn_qkv_inp_norm;
+
+    // a planned row concatenation of GGUF tensors (skipped by the loader), made in load_arch_tensors_derived
+    struct concat_rows_job {
+        std::vector<std::string> parts;
+        std::string     name;
+        ggml_type       type;
+        int64_t         ne0;
+        int64_t         ne1;
+        ggml_tensor **  dst;
+        ggml_tensor * const * buft_ref; // a tensor of the same layer: the result goes on its buffer type
+    };
+    std::vector<concat_rows_job> concat_jobs;
+
+    // plan *dst = rows of parts (name, expected rows) stacked in order; false (nothing planned) unless all parts
+    // exist with the same type and width ne0, so the caller loads them separately instead
+    bool plan_concat_rows(llama_model_loader & ml, const std::vector<std::pair<std::string, int64_t>> & parts, int64_t ne0,
+            const std::string & name, ggml_tensor ** dst, ggml_tensor * const * buft_ref);
+    void load_arch_tensors_derived(llama_model_loader & ml) override;
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+        // mix() as one op with the row RMS norms around it: cur raw (or its cached norm), the
+        // result rms_norm(y, eps_out)*out_w (out_w optional); raw: also the raw result y
+        bool mix_fused() const;
+        bool row_exact_verify() const;
+        ggml_tensor * mix_normed(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query,
+                ggml_tensor * out_w, float eps_out, ggml_tensor ** raw = nullptr);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
@@ -2666,8 +2719,13 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * state,
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
-                int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+                int64_t offset,
+                ggml_ssm_conv_post post = GGML_SSM_CONV_POST_NONE,
+                float post_param = 0.0f,
+                int64_t group = 0,
+                ggml_tensor * residual = nullptr);
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
+                const loop_layer & loop, int ctrl, ggml_tensor * gate = nullptr);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2676,22 +2734,48 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
-        // cache slot il of physical layer ip; messages [LOOP_CTRL_COUNT, n_embd, n_tokens] are mixed into its inputs
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
-                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
+                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr, ggml_tensor * messages_norm = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
 
+        // layer visits in execution order: visit v reads the running block partial at its input as layer input v,
+        // the final normed hidden state is layer input n_visit (the speculative drafters' target features)
+        int  n_visit = 0;
+        void tap_layer_inp(int visit, ggml_tensor * cur);
+
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
+        llm_graph_input_attn_kv_iswa        * attn = nullptr;
         llm_graph_input_rs                  * recr = nullptr;
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
 
-        // the normalized state stacks of mix(), keyed by their tensors
-        ggml_tensor * mix_stack(const std::vector<ggml_tensor *> & list);
+        // mix() reuses the per-row RMS norm of each state and the stacked norms of each block list
+        ggml_tensor * mix_norm(ggml_tensor * x);
+        ggml_tensor * mix_stack(const std::vector<ggml_tensor *> & blocks);
+        std::map<ggml_tensor *, ggml_tensor *>               mix_norms;
         std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_stacks;
+        // constant parts of the relative-position bias table, shared by the layers
+        ggml_tensor * rel_rows(int64_t n_extent);
+        ggml_tensor * rel_cols();
 
-        std::map<int64_t, ggml_tensor *> zero_sinks; // by head count
+        ggml_tensor * rel_rows_swa  = nullptr;
+        ggml_tensor * rel_rows_full = nullptr;
+        ggml_tensor * rel_cols_t    = nullptr;
+
+        // I32 n_conv - 1, ..., 0: flips the input-dependent taps of the convolutions to the order of their windows
+        ggml_tensor * conv_flip(const ggml_tensor * weight);
+        ggml_tensor * conv_flip_t   = nullptr;
+
+        // the convolution taps with the residual and the output scale folded in
+        ggml_tensor * conv_weight(ggml_tensor * weight, float scale);
+        std::map<std::pair<const ggml_tensor *, float>, ggml_tensor *> conv_weights;
+        ggml_tensor * conv_last_t   = nullptr;
+
+        // rollback mode: the conv states 1 ... Kw - 1 tokens back into their rollback slots (slot 0 is the fused store)
+        void store_conv_rollback(llm_graph_input_rs * inp, ggml_tensor * state, ggml_tensor * x, int64_t n_cols, size_t offs);
+        ggml_tensor * rs_slot_rev_t = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

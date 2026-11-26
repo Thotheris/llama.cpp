@@ -989,6 +989,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
 
+    // LLAMA_DSPARK_DUMP=<prefix> (with LLAMA_DFLASH_DEV=0): the injected features as records {seq, pos, row} in
+    // <prefix>.feat, for a numeric reference of the draft
+    FILE * dump_feat = nullptr;
+
     std::vector<common_sampler_ptr> smpls;
 
     // backend sampler chain per seq, attached to ctx_dft
@@ -1134,6 +1138,11 @@ protected:
                 }
             }
             LOG_INF("%s: DFlash target features via %s\n", __func__, use_dev_features ? "device buffer" : "host copies");
+
+            const char * dump = getenv("LLAMA_DSPARK_DUMP");
+            if (dump != nullptr && !use_dev_features) {
+                dump_feat = std::fopen((std::string(dump) + ".feat").c_str(), "wb");
+            }
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, opt.nextn_masked);
@@ -1144,8 +1153,16 @@ protected:
     // called after the injection of a chunk, while h_nextn still holds the context features of batch_inject
     virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*n_chunk*/) {}
 
+    // the last n_inject_outputs() rows of each sequence of a target batch are injected as outputs, and
+    // store_inject_outputs() reads their h_nextn after each injection (both feature paths)
+    virtual int32_t n_inject_outputs() const { return 0; }
+    virtual void store_inject_outputs(llama_seq_id /*seq_id*/) {}
+
 public:
     ~common_speculative_impl_draft_dflash() override {
+        if (dump_feat) {
+            std::fclose(dump_feat);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1177,7 +1194,16 @@ public:
         }
     }
 
+    int64_t t_process_last_us = 0; // duration of the last process() call
+
     bool process(const common_batch & batch_in) override {
+        const int64_t t_start_us = ggml_time_us();
+        const bool ok = process_impl(batch_in);
+        t_process_last_us = ggml_time_us() - t_start_us;
+        return ok;
+    }
+
+    bool process_impl(const common_batch & batch_in) {
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1226,6 +1252,9 @@ public:
                 continue;
             }
 
+            // rows at or after out_beg are injected as outputs
+            const int32_t out_beg = n_rows - std::min(n_rows, n_inject_outputs());
+
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
@@ -1236,7 +1265,7 @@ public:
                         const int32_t   row        = i_batch_beg[seq_id] + offset + i;
                         const llama_pos p          = batch_in.tokens[row].pos[0];
                         const llama_pos pos_arr[4] = { p, p, p, 0 };
-                        batch_inject.add_embd_row(row, pos_arr, seq_id, false);
+                        batch_inject.add_embd_row(row, pos_arr, seq_id, offset + i >= out_beg);
                     }
 
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
@@ -1246,6 +1275,7 @@ public:
                         return false;
                     }
                     store_context_features(seq_id, n_chunk);
+                    store_inject_outputs(seq_id);
                     continue;
                 }
 
@@ -1268,7 +1298,7 @@ public:
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
-                    batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, offset + i >= out_beg);
                 }
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
                 if (rc != 0) {
@@ -1276,7 +1306,16 @@ public:
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
+                if (dump_feat) {
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const int32_t hdr[2] = { seq_id, batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0] };
+                        std::fwrite(hdr, sizeof(hdr), 1, dump_feat);
+                        std::fwrite(features_buf.data() + (size_t) i * n_embd_enc, sizeof(float), n_embd_enc, dump_feat);
+                    }
+                    std::fflush(dump_feat);
+                }
                 store_context_features(seq_id, n_chunk);
+                store_inject_outputs(seq_id);
             }
         }
 
@@ -1388,15 +1427,65 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     std::vector<std::mt19937> draw_rng;
     std::vector<int64_t>      draw_seed; // the seed each generator was last seeded with (-1: reseed)
 
+    // an Inkling2 target: the verify batch stays inside one 256-cell block (see n_cap in draft())
+    bool tgt_inkling2 = false;
+
+    // the Inkling2 draft of dspark-inkling2.cpp (a drafter in the mtp.safetensors layout, dspark_fuse): the markov
+    // head reads f_rnn, the feature mix of the last committed token, which the injection outputs as h_nextn; kept per
+    // sequence for the last F_RNN_RING positions, and every draft runs the full trained block (the drafts past n_max
+    // are not read out). A drafter from the upstream converter takes the has_markov_context path instead
+    bool ink_draft = false;
+    static constexpr int32_t F_RNN_RING = 32;
+    std::vector<float>     f_rnn;     // [n_seq, F_RNN_RING, n_embd_dec]
+    std::vector<llama_pos> f_rnn_pos; // [n_seq, F_RNN_RING], -1 if empty
+    std::vector<float>     f_rnn_zero;
+    bool f_rnn_warned = false;
+
+    // LLAMA_DSPARK_LOG=1: one line per verified draft (draft size, accepted, draft / verify+inject ms)
+    bool log_rounds = false;
+    std::vector<int32_t> round_n_draft;
+    std::vector<double>  round_draft_ms;
+    std::vector<int64_t> round_draft_end_us;
+
+    // LLAMA_SPEC_ADAPT=<rate> (off by default): adaptive pausing (as upstream llama.cpp PR 32773). Per sequence, an
+    // EMA (weight LLAMA_SPEC_ADAPT_EMA, 0.15) of the accepted fraction of each verified draft; once it has at least
+    // LLAMA_SPEC_ADAPT_MIN (8) drafts and falls below <rate>, the sequence decodes LLAMA_SPEC_ADAPT_PAUSE (64) tokens
+    // without a draft, then drafts again with a fresh EMA. Two states only, a full draft or none, so the verify batch
+    // keeps its size (a new size rebuilds the graph). <rate>: the break-even acceptance of the drafter on the device.
+    float   adapt_rate  = 0.0f;
+    float   adapt_w     = 0.15f;
+    int32_t adapt_min   = 8;
+    int32_t adapt_pause = 64;
+    std::vector<float>   adapt_ema;    // [n_seq]
+    std::vector<int32_t> adapt_n;      // [n_seq] drafts in the EMA
+    std::vector<int32_t> adapt_left;   // [n_seq] tokens left in the pause
+    std::vector<int32_t> last_n_draft; // [n_seq] size of the last draft, 0 when none is pending
+    int64_t adapt_paused = 0;          // pauses started, for the log
+
+    // LLAMA_DSPARK_DUMP=<prefix>: the first draft blocks as records {seq, pos0, n_block, n_vocab, tokens, f_rnn,
+    // n_out, logits of the draft slots} in <prefix>.draft (backend sampling off, so the logits are on the host)
+    FILE * dump_draft = nullptr;
+    int32_t dump_left = 12;
+
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
         const llama_model * model_dft = llama_get_model(this->params.ctx_dft);
+        const llama_model * model_tgt = llama_get_model(this->params.ctx_tgt);
 
         {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
                 sample_from_anchor = std::strcmp(buf, "true") == 0;
+            }
+            char arch[32] = {};
+            tgt_inkling2 = llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) >= 0 &&
+                std::strncmp(arch, "inkling2", 8) == 0;
+            if (tgt_inkling2 && llama_model_meta_val_str(model_dft, "dflash.dspark.markov_rank", buf, sizeof(buf)) >= 0) {
+                ink_draft = true;
+                f_rnn.assign((size_t) n_seq * F_RNN_RING * n_embd_dec, 0.0f);
+                f_rnn_pos.assign((size_t) n_seq * F_RNN_RING, -1);
+                f_rnn_zero.assign(n_embd_dec, 0.0f);
             }
             if (llama_model_meta_val_str(model_dft, "dflash.has_markov_context", buf, sizeof(buf)) >= 0) {
                 has_markov_context = std::strcmp(buf, "true") == 0;
@@ -1417,19 +1506,48 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             const bool has_conf =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
                 std::strcmp(buf, "true") == 0;
-            if (!has_conf) {
+            if (!has_conf && !ink_draft) {
                 throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
             }
         }
 
-        LOG_INF("%s: - sample_from_anchor=%s, has_markov_context=%s\n", __func__,
-                sample_from_anchor ? "true" : "false", has_markov_context ? "true" : "false");
+        LOG_INF("%s: - sample_from_anchor=%s, has_markov_context=%s, inkling2 draft=%s\n", __func__,
+                sample_from_anchor ? "true" : "false", has_markov_context ? "true" : "false", ink_draft ? "true" : "false");
+
+        {
+            const char * env = getenv("LLAMA_DSPARK_LOG");
+            log_rounds = env != nullptr && atoi(env) != 0;
+            round_n_draft.assign(n_seq, 0);
+            round_draft_ms.assign(n_seq, 0.0);
+            round_draft_end_us.assign(n_seq, 0);
+        }
+
+        if (const char * env = getenv("LLAMA_SPEC_ADAPT")) {
+            adapt_rate = (float) atof(env);
+            auto env_or = [](const char * name, double def) { const char * v = getenv(name); return v ? atof(v) : def; };
+            adapt_w     = (float) env_or("LLAMA_SPEC_ADAPT_EMA", 0.15);
+            adapt_min   = (int32_t) env_or("LLAMA_SPEC_ADAPT_MIN", 8);
+            adapt_pause = (int32_t) env_or("LLAMA_SPEC_ADAPT_PAUSE", 64);
+            if (adapt_rate > 0.0f) {
+                LOG_INF("%s: adaptive pausing: below an acceptance of %.3f (EMA %.2f, after %d drafts) pause %d tokens\n",
+                        __func__, adapt_rate, adapt_w, adapt_min, adapt_pause);
+            }
+        }
+        adapt_ema.assign(n_seq, 0.0f);
+        adapt_n.assign(n_seq, 0);
+        adapt_left.assign(n_seq, 0);
+        last_n_draft.assign(n_seq, 0);
+
+        const char * dump = getenv("LLAMA_DSPARK_DUMP");
+        if (dump != nullptr && ink_draft) {
+            dump_draft = std::fopen((std::string(dump) + ".draft").c_str(), "wb");
+        }
 
         // anchor-first DSpark yields a full block_size draft tokens
         // the context state is read back from h_nextn at every injected row
         init({
             /* .n_draft_max      = */ sample_from_anchor ? block_size : block_size - 1,
-            /* .backend_sampling = */ true,
+            /* .backend_sampling = */ dump_draft == nullptr,
             /* .dev_features     = */ true,
             /* .nextn_masked     = */ !has_markov_context,
         });
@@ -1475,8 +1593,81 @@ public:
         common_speculative_impl_draft_dflash::begin(seq_id, prompt);
     }
 
+    ~common_speculative_impl_draft_dspark() override {
+        if (dump_draft) {
+            std::fclose(dump_draft);
+        }
+    }
+
+protected:
+    // a verify batch of up to n_max + 1 tokens: any of its positions can be the last committed one
+    int32_t n_inject_outputs() const override { return ink_draft ? params.n_max + 1 : 0; }
+
+    void store_inject_outputs(llama_seq_id seq_id) override {
+        if (!ink_draft) {
+            return;
+        }
+        for (int32_t i = 0; i < batch_inject.size(); ++i) {
+            if (!batch_inject.tokens[i].output) {
+                continue;
+            }
+            const float * row = llama_get_embeddings_nextn_ith(params.ctx_dft, i);
+            if (row == nullptr) {
+                continue;
+            }
+            const llama_pos pos  = batch_inject.tokens[i].pos[0];
+            const size_t    slot = (size_t) seq_id * F_RNN_RING + (size_t) pos % F_RNN_RING;
+            std::memcpy(f_rnn.data() + slot * n_embd_dec, row, (size_t) n_embd_dec * sizeof(float));
+            f_rnn_pos[slot] = pos;
+        }
+    }
+
+    const float * get_f_rnn(llama_seq_id seq_id, llama_pos pos) {
+        const size_t slot = (size_t) seq_id * F_RNN_RING + (size_t) (pos < 0 ? 0 : pos) % F_RNN_RING;
+        if (pos >= 0 && f_rnn_pos[slot] == pos) {
+            return f_rnn.data() + slot * n_embd_dec;
+        }
+        if (!f_rnn_warned) {
+            LOG_WRN("%s: no f_rnn for seq %d pos %d, drafting with zeros\n", __func__, (int) seq_id, (int) pos);
+            f_rnn_warned = true;
+        }
+        return f_rnn_zero.data();
+    }
+
+public:
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (is_other || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        if (adapt_rate > 0.0f && last_n_draft[seq_id] > 0) {
+            const float r = std::min(1.0f, (float) n_accepted / (float) last_n_draft[seq_id]);
+            adapt_ema[seq_id] = adapt_n[seq_id] == 0 ? r : (1.0f - adapt_w) * adapt_ema[seq_id] + adapt_w * r;
+            adapt_n[seq_id]++;
+            if (adapt_n[seq_id] >= adapt_min && adapt_ema[seq_id] < adapt_rate) {
+                adapt_left[seq_id] = adapt_pause;
+                adapt_n[seq_id]    = 0;
+                adapt_paused++;
+                if (log_rounds) {
+                    LOG_INF("dspark-pause seq=%d ema=%.3f pauses=%lld\n", (int) seq_id, adapt_ema[seq_id], (long long) adapt_paused);
+                }
+            }
+        }
+        last_n_draft[seq_id] = 0;
+        if (!log_rounds || round_n_draft[seq_id] <= 0) {
+            return;
+        }
+        // verify: from the end of the draft to the acceptance, the target pass, the injection and the sampling
+        const double verify_ms = (ggml_time_us() - round_draft_end_us[seq_id]) / 1000.0;
+        LOG_INF("dspark-round seq=%d n_draft=%d n_acc=%d draft_ms=%.3f verify_ms=%.3f inject_ms=%.3f\n",
+                (int) seq_id, round_n_draft[seq_id], (int) n_accepted, round_draft_ms[seq_id], verify_ms,
+                t_process_last_us / 1000.0);
+        round_n_draft[seq_id] = 0;
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        const int64_t t_draft_start_us = ggml_time_us();
 
         batch.clear();
 
@@ -1491,6 +1682,11 @@ public:
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
+                continue;
+            }
+            if (adapt_left[seq_id] > 0) {
+                // paused (LLAMA_SPEC_ADAPT): this step decodes one token without a draft
+                adapt_left[seq_id]--;
                 continue;
             }
 
@@ -1513,6 +1709,17 @@ public:
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_draft = params.n_max;
+            if (ink_draft) {
+                // the full trained block, the first n_draft mask slots are read: their outputs end the markov chain
+                const float * f_state = get_f_rnn(seq_id, n - 1);
+                i_block_beg[seq_id] = batch.size();
+                n_block    [seq_id] = n_draft + 1;
+                for (int32_t i = 0; i < block_size; ++i) {
+                    const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, i <= n_draft);
+                    batch.set_embd_state(idx, { f_state, 1, (size_t) n_embd_dec });
+                }
+                continue;
+            }
             const int32_t n_block_tokens = n_draft + (sample_from_anchor ? 0 : 1);
 
             // all blocks share one decode: a block that does not fit in the draft context fails every sequence's draft
@@ -1566,16 +1773,40 @@ public:
 
             auto * smpl = smpls[seq_id].get();
 
+            if (dump_draft && dump_left > 0) {
+                --dump_left;
+                const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                const int32_t hdr[4]  = { seq_id, (int32_t) dp.pos0, block_size, n_vocab };
+                std::fwrite(hdr, sizeof(hdr), 1, dump_draft);
+                for (int32_t i = 0; i < block_size; ++i) {
+                    const int32_t tok = batch.tokens[beg + i].id;
+                    std::fwrite(&tok, sizeof(tok), 1, dump_draft);
+                }
+                std::fwrite(get_f_rnn(seq_id, (llama_pos) dp.pos0 - 1), sizeof(float), n_embd_dec, dump_draft);
+                const int32_t n_out = n_block_tokens - 1;
+                std::fwrite(&n_out, sizeof(n_out), 1, dump_draft);
+                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    std::fwrite(llama_get_logits_ith(ctx_dft, beg + i), sizeof(float), n_vocab, dump_draft);
+                }
+                std::fflush(dump_draft);
+            }
+
             auto & result = *dp.result;
 
             // bonus-anchor drafts read the mask positions only, like DFlash
             const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
 
+            // an Inkling2 target: the verify batch (positions pos0 ... pos0 + n_draft) stays in one block of 256
+            // cells. The KV cache pads the attended cells to a multiple of 256 (llama_kv_cache::get_n_kv) and the
+            // row-exact verify attention splits them by that count, so a row reproduces its single-token decode
+            // only if the whole batch pads to the count of its own decode (one sequence: cell = position)
+            const int32_t n_cap = tgt_inkling2 ? 255 - (int32_t) (dp.pos0 % 256) : n_block_tokens;
+
             if (sampled[seq_id]) {
                 // the tokens the graph drew, and the distribution q each one was drawn from
                 const float * draws = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(draws && "DSpark draws missing from h_nextn");
-                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                for (int32_t i = i_draft_beg; i < n_block_tokens && (int32_t) result.size() < n_cap; ++i) {
                     const float * row = draws + (size_t) (beg + i) * n_embd_dec;
                     const int32_t n_cand = (int32_t) row[1];
 
@@ -1596,10 +1827,20 @@ public:
 
             // DSpark: read from the first draft slot, truncate below the confidence threshold
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
-            for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+            // the Inkling2 draft: the confidence is the draft's own top-1 probability (no confidence head), and
+            // the draft stops once the product over its tokens, an estimate of the chance that all of them are
+            // accepted, falls below p_min
+            float conf_prod = 1.0f;
+            for (int32_t i = i_draft_beg; i < n_block_tokens && (int32_t) result.size() < n_cap; ++i) {
                 const int32_t idx = beg + i;
 
-                if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                if (conf && ink_draft) {
+                    const float * row = llama_get_embeddings_nextn_ith(ctx_dft, idx);
+                    conf_prod *= row ? row[0] : 1.0f;
+                    if (conf_prod < params.p_min) {
+                        break;
+                    }
+                } else if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
                     break;
                 }
 
@@ -1622,6 +1863,24 @@ public:
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+            }
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_block_beg[seq_id] >= 0) {
+                last_n_draft[seq_id] = (int32_t) dparams[seq_id].result->size();
+            }
+        }
+
+        if (log_rounds) {
+            const int64_t t_end_us = ggml_time_us();
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+                round_n_draft     [seq_id] = (int32_t) dparams[seq_id].result->size();
+                round_draft_ms    [seq_id] = (t_end_us - t_draft_start_us) / 1000.0;
+                round_draft_end_us[seq_id] = t_end_us;
             }
         }
     }

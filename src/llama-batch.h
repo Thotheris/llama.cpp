@@ -193,8 +193,10 @@ public:
 
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
+    //   with allow_gaps == true the ids only have to increase (f.ex. 0, 1, 2, 4): for a memory whose attention
+    //   splits the ubatch into runs of consecutive streams (see llama_kv_cache::get_stream_runs)
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, bool allow_gaps = false);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     // TODO: extend to support multiple _full_ sequences in the ubatch

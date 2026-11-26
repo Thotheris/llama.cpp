@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -1403,7 +1404,36 @@ uint32_t llama_kv_cache::get_n_kv_rows(const llama_ubatch & ubatch) const {
     return std::min(std::max(n_pad_cur, GGML_PAD(n_max, n_pad_cur)), get_size());
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+std::vector<std::pair<uint32_t, uint32_t>> llama_kv_cache::get_stream_runs(const slot_info & sinfo) {
+    std::vector<std::pair<uint32_t, uint32_t>> res;
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        if (!res.empty() && sinfo.strm[s] == sinfo.strm[s - 1] + 1) {
+            res.back().second++;
+        } else {
+            res.push_back({ s, 1 });
+        }
+    }
+
+    return res;
+}
+
+// the first stream and the number of streams of a K/V view, see get_k()
+static std::pair<uint32_t, uint32_t> kv_view_streams(const llama_kv_cache::slot_info & sinfo, uint32_t i0, uint32_t ns) {
+    if (ns == 0) {
+        // a single view over the streams of the ubatch, they must be consecutive (else get_stream_runs() has several runs)
+        GGML_ASSERT(sinfo.s1 - sinfo.s0 + 1 == sinfo.n_stream() && "the streams of the ubatch are not consecutive");
+
+        return { sinfo.s0, sinfo.s1 - sinfo.s0 + 1 };
+    }
+
+    GGML_ASSERT(i0 + ns <= sinfo.n_stream());
+    GGML_ASSERT(sinfo.strm[i0 + ns - 1] == sinfo.strm[i0] + (llama_seq_id) ns - 1);
+
+    return { (uint32_t) sinfo.strm[i0], ns };
+}
+
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0, uint32_t ns_run) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -1413,17 +1443,17 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const auto [s0, ns] = kv_view_streams(sinfo, i0, ns_run);
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*s0);
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0, uint32_t ns_run) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1434,7 +1464,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     // [TAG_V_CACHE_VARIABLE]
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const auto [s0, ns] = kv_view_streams(sinfo, i0, ns_run);
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
@@ -1443,7 +1473,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*s0);
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -1452,7 +1482,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*s0);
 }
 
 static bool is_type_scaled(ggml_type type) {
@@ -1924,8 +1954,6 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
         ggml_tensor * dst = attn_mask.raw;
         const int32_t * rows = attn_mask.rows && attn_mask.rows->buffer ? (const int32_t *) attn_mask.rows->data : nullptr;
 
-        const uint32_t n_tokens = ubatch->n_tokens;
-
         const int64_t n_kv     = dst->ne[0];
         const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
 
@@ -1935,46 +1963,54 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
             GGML_ASSERT(attn_mask.rows->ne[0] == n_kv && attn_mask.rows->ne[1] == n_stream);
         }
 
-        GGML_ASSERT(n_tokens%n_stream == 0);
-
-        // n_tps == n_tokens_per_stream
-        const int64_t n_tps = n_tokens/n_stream;
-
-        // see llama_non_causal_type
-        // only the SWA cache (or the SWA layers of a single cache) become non-causal
-        if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
-            causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
-        }
-        if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY) {
-            causal_attn = swa_type != LLAMA_SWA_TYPE_NONE;
-        }
-
-        //const int64_t t_start = ggml_time_us();
-
-        const args_set_input_attn_mask args = {
-            /*.hparams          =*/ hparams,
-            /*.ubatch           =*/ ubatch,
-            /*.v_cells          =*/ v_cells,
-            /*.seq_to_stream    =*/ seq_to_stream,
-            /*.n_swa            =*/ n_swa,
-            /*.swa_type         =*/ swa_type,
-            /*.n_kv             =*/ n_kv,
-            /*.n_stream         =*/ n_stream,
-            /*.n_tps            =*/ n_tps,
-            /*.rows             =*/ rows,
-            /*.block_uniform    =*/ attn_mask.block_uniform,
-        };
-
-        if (dst->type == GGML_TYPE_F16) {
-            set_input_attn_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
-        } else {
-            set_input_attn_mask_impl<float>(args, (float *) dst->data, causal_attn);
-        }
-
-        //const int64_t t_end = ggml_time_us();
-
-        //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+        fill_attn_mask(dst->data, dst->type, ubatch, n_kv, n_stream, rows, attn_mask.block_uniform, causal_attn);
     }
+}
+
+void llama_kv_cache::fill_attn_mask(void * data, ggml_type type, const llama_ubatch * ubatch, int64_t n_kv, int64_t n_stream,
+        const int32_t * rows, bool block_uniform, bool causal_attn) const {
+    const uint32_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(n_tokens%n_stream == 0);
+
+    // n_tps == n_tokens_per_stream
+    const int64_t n_tps = n_tokens/n_stream;
+
+    // see llama_non_causal_type
+    // only the SWA cache (or the SWA layers of a single cache) become non-causal
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY) {
+        causal_attn = swa_type != LLAMA_SWA_TYPE_NONE;
+    }
+
+    //const int64_t t_start = ggml_time_us();
+
+    const args_set_input_attn_mask args = {
+        /*.hparams          =*/ hparams,
+        /*.ubatch           =*/ ubatch,
+        /*.v_cells          =*/ v_cells,
+        /*.seq_to_stream    =*/ seq_to_stream,
+        /*.n_swa            =*/ n_swa,
+        /*.swa_type         =*/ swa_type,
+        /*.n_kv             =*/ n_kv,
+        /*.n_stream         =*/ n_stream,
+        /*.n_tps            =*/ n_tps,
+        /*.rows             =*/ rows,
+        /*.block_uniform    =*/ block_uniform,
+    };
+
+    if (type == GGML_TYPE_F16) {
+        set_input_attn_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) data, causal_attn);
+    } else {
+        GGML_ASSERT(type == GGML_TYPE_F32);
+        set_input_attn_mask_impl<float>(args, (float *) data, causal_attn);
+    }
+
+    //const int64_t t_end = ggml_time_us();
+
+    //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2127,13 +2163,144 @@ bool llama_kv_cache::has_cell_ext() const {
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
 }
 
-void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+// one row block of set_input_relative_pos: token i reads the cell positions cp[i] of its (stream, sequence), INT32_MIN
+// where the sequence has no cell; a cell the mask of fill_attn_mask drops gets extent + 1, any other the clamped distance
+template<bool causal, bool swa>
+static void rel_pos_rows(int32_t * data, int64_t n_kv, uint32_t i0, uint32_t i1, const llama_pos * const * cp,
+        const llama_pos * p1, const llama_pos * pi, const llama_pos * pmin, int32_t extent,
+        uint32_t n_swa, llama_swa_type swa_type, bool swa_full_span) {
+    for (uint32_t i = i0; i < i1; ++i) {
+        const llama_pos * c = cp[i];
+        const llama_pos q1 = p1[i], qi = pi[i], qmin = pmin[i];
+        int32_t * row = data + (int64_t) i*n_kv;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const llama_pos p0 = c[j];
+            bool drop = p0 == INT32_MIN;
+            if (causal) {
+                drop = drop || p0 > q1;
+            }
+            if (swa && !drop) {
+                const bool in_span = !causal && swa_full_span && p0 >= qmin;
+                drop = !in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, q1);
+            }
+            const int64_t d = (int64_t) qi - p0;
+            row[j] = drop ? extent + 1 : (d >= 0 && d < extent ? (int32_t) d : extent);
+        }
+    }
+}
+
+void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent,
+        const llm_attn_mask * attn_mask, bool causal_attn) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     const int64_t n_kv = dst->ne[0];
+
+    // fast path, same values as below: the mask of fill_attn_mask evaluated per cell from compact per-sequence cell
+    // positions, rows split over threads, written straight into a host tensor (O(n_kv * n_tokens) at every ubatch)
+    if (attn_mask && !hparams.use_alibi && !ubatch->is_pos_2d() && getenv("LLAMA_REL_POS_SLOW") == nullptr) {
+        GGML_ASSERT(attn_mask->raw && attn_mask->rows == nullptr && attn_mask->raw->ne[0] == n_kv);
+        const uint32_t n_tokens = ubatch->n_tokens;
+
+        // the causality fill_attn_mask uses
+        bool causal = causal_attn;
+        if (!causal && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+            causal = swa_type == LLAMA_SWA_TYPE_NONE;
+        }
+        if (!causal && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY) {
+            causal = swa_type != LLAMA_SWA_TYPE_NONE;
+        }
+        const bool swa = swa_type != LLAMA_SWA_TYPE_NONE;
+        const bool swa_full_span = hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL;
+
+        llama_pos seq_pos_min[LLAMA_MAX_SEQ];
+        uint32_t  seq_first[LLAMA_MAX_SEQ];
+        std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
+        std::fill(seq_first,   seq_first   + LLAMA_MAX_SEQ, n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+            seq_first[seq_id]   = std::min(seq_first[seq_id],   i);
+        }
+
+        // compact cell positions of each (stream, sequence) of the ubatch
+        std::map<std::pair<uint32_t, llama_seq_id>, std::vector<llama_pos>> cpos;
+        std::vector<const llama_pos *> cp(n_tokens);
+        std::vector<llama_pos> p1(n_tokens), pi(n_tokens), pmin(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const uint32_t stream = seq_to_stream.at(seq_id);
+            auto it = cpos.find({stream, seq_id});
+            if (it == cpos.end()) {
+                const auto & cells = v_cells.at(stream);
+                std::vector<llama_pos> v(n_kv);
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    v[j] = cells.is_empty(j) || !cells.seq_has(j, seq_id) ? INT32_MIN : cells.pos_get(j);
+                }
+                it = cpos.emplace(std::make_pair(stream, seq_id), std::move(v)).first;
+            }
+            cp[i]   = it->second.data();
+            p1[i]   = ubatch->pos[attn_mask->block_uniform ? seq_first[seq_id] : i];
+            pi[i]   = ubatch->pos[i];
+            pmin[i] = seq_pos_min[seq_id];
+        }
+
+        const bool host = dst->buffer && ggml_backend_buffer_is_host(dst->buffer);
+        static thread_local std::vector<int32_t> staging;
+        if (!host && staging.size() < (size_t) (n_kv*n_tokens)) {
+            staging.resize(n_kv*n_tokens);
+        }
+        int32_t * data = host ? (int32_t *) dst->data : staging.data();
+
+        auto rows = [&](uint32_t i0, uint32_t i1) {
+            if (causal) {
+                if (swa) rel_pos_rows<true,  true >(data, n_kv, i0, i1, cp.data(), p1.data(), pi.data(), pmin.data(), extent, n_swa, swa_type, swa_full_span);
+                else     rel_pos_rows<true,  false>(data, n_kv, i0, i1, cp.data(), p1.data(), pi.data(), pmin.data(), extent, n_swa, swa_type, swa_full_span);
+            } else {
+                if (swa) rel_pos_rows<false, true >(data, n_kv, i0, i1, cp.data(), p1.data(), pi.data(), pmin.data(), extent, n_swa, swa_type, swa_full_span);
+                else     rel_pos_rows<false, false>(data, n_kv, i0, i1, cp.data(), p1.data(), pi.data(), pmin.data(), extent, n_swa, swa_type, swa_full_span);
+            }
+        };
+
+        // threads only for large tables (decode: n_tokens == 1)
+        const int64_t n_cells = n_kv*n_tokens;
+        const uint32_t n_thr = n_cells < (1 << 20) ? 1 : std::min<uint32_t>(8, std::max<uint32_t>(1, std::thread::hardware_concurrency()/2));
+        if (n_thr == 1) {
+            rows(0, n_tokens);
+        } else {
+            std::vector<std::thread> workers;
+            const uint32_t per = (n_tokens + n_thr - 1)/n_thr;
+            for (uint32_t t = 1; t < n_thr; ++t) {
+                const uint32_t i0 = std::min(n_tokens, t*per), i1 = std::min(n_tokens, (t + 1)*per);
+                if (i0 < i1) {
+                    workers.emplace_back(rows, i0, i1);
+                }
+            }
+            rows(0, std::min(n_tokens, per));
+            for (auto & w : workers) {
+                w.join();
+            }
+        }
+        if (!host) {
+            ggml_backend_tensor_set(dst, data, 0, ggml_nbytes(dst));
+        }
+        return;
+    }
+
+    // the dense mask, same layout as the distances
+    std::vector<float> mask;
+    if (attn_mask) {
+        GGML_ASSERT(attn_mask->raw && attn_mask->rows == nullptr && attn_mask->raw->ne[0] == n_kv);
+        mask.resize(n_kv * ubatch->n_tokens);
+        fill_attn_mask(mask.data(), GGML_TYPE_F32, ubatch, n_kv, attn_mask->raw->ne[3], nullptr, attn_mask->block_uniform, causal_attn);
+    }
+
     std::vector<int32_t> data(n_kv * ubatch->n_tokens);
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[i][0]));
         for (int64_t j = 0; j < n_kv; ++j) {
+            if (attn_mask && std::isinf(mask[i*n_kv + j]) && mask[i*n_kv + j] < 0.0f) {
+                data[i*n_kv + j] = extent + 1;
+                continue;
+            }
             const int64_t distance = cells.is_empty(j) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(j);
             data[i*n_kv + j] = distance >= 0 && distance < extent ? distance : extent;
         }
@@ -3192,6 +3359,18 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
+ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t ns) const {
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], i0, ns);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t ns) const {
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], i0, ns);
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> llama_kv_cache_context::get_stream_runs() const {
+    return llama_kv_cache::get_stream_runs(sinfos[i_cur]);
+}
+
 ggml_tensor * llama_kv_cache_context::get_k_scale(int32_t il) const {
     return kv->get_k_scale(il);
 }
@@ -3249,8 +3428,9 @@ void llama_kv_cache_context::set_input_kpool(ggml_tensor * pool_idxs, ggml_tenso
     kv->set_input_kpool(pool_idxs, pool_pos, pool_mask, tail_idxs, ubatch, sinfos[i_cur], kpool, n_kv);
 }
 
-void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
-    kv->set_input_relative_pos(dst, ubatch, extent);
+void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent,
+        const llm_attn_mask * attn_mask, bool causal_attn) const {
+    kv->set_input_relative_pos(dst, ubatch, extent, attn_mask, causal_attn);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

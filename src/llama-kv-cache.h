@@ -204,8 +204,14 @@ public:
     uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // the K/V views of the streams [sinfo.strm[i0], sinfo.strm[i0] + ns) - a run of consecutive streams
+    // ns == 0: all the streams of the ubatch, which must then be consecutive
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0 = 0, uint32_t ns = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0 = 0, uint32_t ns = 0) const;
+
+    // the runs of consecutive streams of a ubatch: {first ubatch stream, number of streams}, a single run when the
+    // streams are consecutive (or with a unified cache)
+    static std::vector<std::pair<uint32_t, uint32_t>> get_stream_runs(const slot_info & sinfo);
 
     ggml_tensor * get_k_scale(int32_t il) const;
     ggml_tensor * get_v_scale(int32_t il) const;
@@ -258,7 +264,11 @@ public:
     //   tail_idxs [kpool, n_tokens]        I32: cells of the token's own pool, the token's cell for the members it does not have yet
     void set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_pos, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
             const llama_ubatch * ubatch, const slot_info & sinfo, uint32_t kpool, uint32_t n_kv) const;
-    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // distance from each token to each cell, extent past the extent
+    // with a mask, the cells it masks (future, empty, other sequence, outside the window) get extent + 1 instead,
+    // so that a bias gathered by distance is the mask as well; the mask tensor need not be allocated
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent,
+            const llm_attn_mask * attn_mask = nullptr, bool causal_attn = true) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -272,6 +282,10 @@ public:
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
+    // fill a dense [n_kv, n_tokens] mask (F16 or F32) of the ubatch, see set_input_attn_mask()
+    void fill_attn_mask(void * data, ggml_type type, const llama_ubatch * ubatch, int64_t n_kv, int64_t n_stream,
+            const int32_t * rows, bool block_uniform, bool causal_attn) const;
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -436,6 +450,12 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
+    // a run of consecutive streams of the current ubatch, see llama_kv_cache::get_stream_runs
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t ns) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t i0, uint32_t ns) const;
+
+    std::vector<std::pair<uint32_t, uint32_t>> get_stream_runs() const;
+
     ggml_tensor * get_k_scale(int32_t il) const;
     ggml_tensor * get_v_scale(int32_t il) const;
 
@@ -465,7 +485,8 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_pos, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
             const llama_ubatch * ubatch, uint32_t kpool) const;
-    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent,
+            const llm_attn_mask * attn_mask = nullptr, bool causal_attn = true) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

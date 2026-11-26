@@ -2281,6 +2281,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
     }
 
+    load_arch_tensors_derived(ml);
+
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
@@ -2336,7 +2338,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    load_arch_derived();
+
     return true;
+}
+
+void llama_model_base::add_derived_buffer(ggml_context * ctx, ggml_backend_buffer_t buf) {
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    buffers.emplace_back(buf);
+    pimpl->ctxs_bufs.emplace_back(ggml_context_ptr { ctx }, std::move(buffers));
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
@@ -2501,6 +2511,36 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
     } else if (hdmd.inverse_blocks.count("token_embd.weight") && !ml.get_weight("output.weight")) {
         throw std::runtime_error("a tied Hadamard output requires version 2 and tied_output=true");
     }
+}
+
+ggml_backend_buffer_type_t llama_model_base::weight_buft(const ggml_tensor * t) const {
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        if (!bufs.empty() && ggml_get_tensor(ctx.get(), ggml_get_name(t)) == t) {
+            return ggml_backend_buffer_get_type(bufs[0].get());
+        }
+    }
+    return nullptr;
+}
+
+void llama_model_base::alloc_derived_tensors(ggml_context * ctx_raw, ggml_backend_buffer_type_t buft, bool no_alloc) {
+    ggml_context_ptr ctx { ctx_raw };
+    ggml_backend_buffer_t buf = nullptr;
+    if (no_alloc) {
+        buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer, see load_tensors
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            t->buffer = buf;
+        }
+    } else {
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+    }
+    if (buf == nullptr) {
+        throw std::runtime_error(format("unable to allocate %s buffer for derived tensors", ggml_backend_buft_name(buft)));
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(buf);
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
 }
 
 // make one Hadamard matrix per block size and one sign vector per width (the GGUF does not contain them)

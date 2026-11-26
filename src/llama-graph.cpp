@@ -18,6 +18,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -1447,7 +1448,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (self_rel_pos->buffer) {
-        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
+        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent, &inp_attn->self_attn_mask, cparams.causal_attn);
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1461,7 +1462,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (self_rel_pos_swa->buffer) {
-        attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+        attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa, &inp_attn->self_attn_mask_swa, cparams.causal_attn);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -2640,12 +2641,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
-                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                    if (lb > 0.0f) {
-                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
-                    }
-                    cur = ggml_mul(ctx0, act, up);
+                    // one fused op; gate and up may be the strided views of the fused gate_up output
+                    cur = ggml_situ(ctx0, cur, up, beta, lb);
                     cb(cur, "ffn_moe_situ", il);
                 } break;
             case LLM_FFN_GELU:
@@ -2727,6 +2724,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_post_exp_norm", il);
     }
 
+    // Use per-layer n_expert_used to bound the graph even during warmup (avoids
+    // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
+    // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
+    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+
+    // weight and sum the experts in one op: out[e, 0, t] = sum_k experts[e, k, t]*weights[0, k, t], out_prod contracts ne1
+    // (verified for Inkling only: it rounds differently from the multiply and the chain of adds)
+    if ((arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) && !weight_before_ffn &&
+            experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(experts) && ggml_is_contiguous(weights) &&
+            experts->ne[1] == (int64_t) n_expert_used_il && experts->ne[2] == n_tokens &&
+            weights->ne[0] == 1 && weights->ne[1] == experts->ne[1] && weights->ne[2] == n_tokens) {
+        ggml_tensor * moe_out = ggml_reshape_2d(ctx0, ggml_out_prod(ctx0, experts, weights), n_embd, n_tokens);
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
@@ -2739,10 +2753,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     assert(n_expert_used > 0);
 
     // order the views before the adds
-    // Use per-layer n_expert_used to bound the graph even during warmup (avoids
-    // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
-    // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
     for (uint32_t i = 0; i < n_expert_used_il; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
@@ -3223,6 +3233,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
                 cur->src[3] = dense_bias_mask();
             }
+        }
+
+        // a speculative verify (every row an output in a context that can roll back, a sequence of 2+ tokens): each row
+        // as it is decoded alone, so that the accepted tokens are the ones the decode without speculation produces. A
+        // batch of one token per sequence (concurrent decode without drafts) is no verify: it keeps the batched form
+        // the decode without speculation runs
+        if (cparams.n_rs_seq > 0 && n_tokens > 1 && n_outputs == n_tokens && ubatch.n_tokens > ubatch.n_seqs_unq) {
+            ggml_flash_attn_ext_set_row_exact(cur, true);
         }
 
         if (v_mla) {
@@ -3757,8 +3775,9 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_tensor * v_mla,
             float     kq_scale,
             int       il,
-        ggml_tensor * bias_table = nullptr,
-        ggml_tensor * bias_indices = nullptr) {
+        ggml_tensor * rel_pos    = nullptr,
+        ggml_tensor * rel_bias   = nullptr,
+            int32_t   masked_pos = 0) {
     ggml_context * ctx0 = gctx.ctx0;
     ggml_cgraph  * gf   = gctx.gf;
 
@@ -3820,11 +3839,82 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+    // flash attention with the rel-bias gather: kq_b per (token, head) and the distance of each cell (rel_pos)
+    auto set_rel_bias = [&](ggml_tensor * cur, ggml_tensor * pos, ggml_tensor * bias) {
+        ggml_tensor * fa = cur;
+        while (fa && fa->op != GGML_OP_FLASH_ATTN_EXT) {
+            fa = fa->src[0];
+        }
+        GGML_ASSERT(fa != nullptr);
 
-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il, bias_table, bias_indices);
+        ggml_flash_attn_ext_set_rel_bias(fa, pos, bias, masked_pos);
+    };
+
+    ggml_tensor * q = q_cur;
+
+    // the streams of a ubatch can have gaps (f.ex. the slots 0, 1, 2 and 4 are generating): the attention runs once
+    // per run of consecutive streams, on views of q, of the masks and of the cache (see llama_kv_cache::get_stream_runs)
+    const auto runs = use_kv_cur || kv_rows ? std::vector<std::pair<uint32_t, uint32_t>>() : mctx_cur->get_stream_runs();
+
+    ggml_tensor * cur = nullptr;
+
+    if (runs.size() <= 1) {
+        ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+
+        cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+        if (rel_pos) {
+            set_rel_bias(cur, rel_pos, rel_bias);
+        }
+    } else {
+        const int64_t n_stream_ub = runs.back().first + runs.back().second;
+        const int64_t n_tps       = q->ne[2]/n_stream_ub;
+
+        GGML_ASSERT(q->ne[2] == n_tps*n_stream_ub);
+
+        // a view of the streams [i0, i0 + ns) of a tensor whose dim 3 is the stream
+        // (a copy when the offset of the view would be misaligned for a backend)
+        auto streams = [&](ggml_tensor * t, uint32_t i0, uint32_t ns) -> ggml_tensor * {
+            if (t == nullptr) {
+                return nullptr;
+            }
+            GGML_ASSERT(t->ne[3] == n_stream_ub);
+            ggml_tensor * r = ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], t->ne[2], ns, t->nb[1], t->nb[2], t->nb[3], i0*t->nb[3]);
+            return (i0*t->nb[3]) % 256 == 0 ? r : ggml_cont(ctx0, r);
+        };
+        // a view of the tokens of the streams [i0, i0 + ns) of a tensor whose dim nd is the token
+        auto tokens = [&](ggml_tensor * t, int nd, uint32_t i0, uint32_t ns) -> ggml_tensor * {
+            const size_t offs = i0*n_tps*t->nb[nd];
+            ggml_tensor * r = nd == 1 ?
+                ggml_view_2d(ctx0, t, t->ne[0], ns*n_tps, t->nb[1], offs) :
+                ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], ns*n_tps, t->nb[1], t->nb[2], offs);
+            return offs % 256 == 0 ? r : ggml_cont(ctx0, r);
+        };
+
+        for (const auto & [i0, ns] : runs) {
+            ggml_tensor * k = mctx_cur->get_k(ctx0, il, i0, ns);
+            ggml_tensor * v = mctx_cur->get_v(ctx0, il, i0, ns);
+
+            // the rel-bias sources are attached to the flash attention node after it entered the graph: put them in first
+            ggml_tensor * pos_run  = rel_pos ? tokens (rel_pos,  1, i0, ns) : nullptr;
+            ggml_tensor * bias_run = rel_pos ? streams(rel_bias,    i0, ns) : nullptr;
+            if (rel_pos) {
+                ggml_build_forward_expand(gf, pos_run);
+                ggml_build_forward_expand(gf, bias_run);
+            }
+
+            ggml_tensor * cur_run = gctx.build_attn_mha(tokens(q, 2, i0, ns), k, v, streams(kq_b, i0, ns), streams(kq_mask, i0, ns),
+                    nullptr, sinks, v_mla, 0, kq_scale, il);
+            if (rel_pos) {
+                set_rel_bias(cur_run, pos_run, bias_run);
+            }
+
+            // [n_embd_v*n_head, n_tokens of the run]
+            GGML_ASSERT(ggml_n_dims(cur_run) <= 2);
+            cur = cur ? ggml_concat(ctx0, cur, cur_run, 1) : cur_run;
+        }
+        ggml_build_forward_expand(gf, cur);
+    }
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     gctx.cb(cur, "kqv_out", il);
 
@@ -4487,21 +4577,49 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
-        ggml_tensor * bias_table,
+        ggml_tensor * kq_b,
         ggml_tensor * sinks,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * rel_pos,
+            int32_t   masked_pos) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
 
     const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
 
-    GGML_ASSERT(attn_mask.rows == nullptr);
-    ggml_tensor * indices = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+    if (rel_pos) {
+        // flash attention gathers the mask of each cell from the per-(token, head) table kq_b by the distance index
+        // rel_pos (ggml_flash_attn_ext_set_rel_bias): the dense [n_kv, n_tokens, n_head] mask is never written
+        GGML_ASSERT(cparams.flash_attn && attn_mask.rows == nullptr);
+        GGML_ASSERT(kq_b->type == GGML_TYPE_F16 && kq_b->ne[1] == attn_mask.raw->ne[1] && kq_b->ne[3] == attn_mask.raw->ne[3]);
+        GGML_ASSERT(rel_pos->ne[0] == attn_mask.raw->ne[0]);
 
-    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, nullptr,
-            sinks, nullptr, kq_scale, il, bias_table, indices);
+        // the flash attention node may enter the graph inside build_attn_iswa_impl, before its rel-bias sources are
+        // attached below: put them in the graph first (an input must be a leaf of the graph to be allocated as one)
+        ggml_build_forward_expand(gf, rel_pos);
+        ggml_build_forward_expand(gf, kq_b);
+
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, nullptr, nullptr, sinks, nullptr, kq_scale, il,
+                rel_pos, kq_b, masked_pos);
+    }
+
+    // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha,
+    //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
+    GGML_ASSERT(attn_mask.rows == nullptr);
+
+    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
+    // the distances send the masked cells to their own index (see set_input_relative_pos), so kq_b, gathered by
+    // distance, is the mask as well: the input mask itself stays out of the graph
+    GGML_ASSERT(kq_b->ne[0] == attn_mask.raw->ne[0] && kq_b->ne[1] == attn_mask.raw->ne[1] && kq_b->ne[3] == attn_mask.raw->ne[3]);
+    ggml_tensor * kq_mask = kq_b;
+    if (cparams.flash_attn && kq_mask->type != GGML_TYPE_F16) {
+        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+    }
+    cb(kq_mask, "kq_mask_rel_pos", il);
+
+    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
 }
 
 void llm_graph_context::build_dense_out(

@@ -468,6 +468,13 @@ llama_context::llama_context(
         const int64_t max_nodes = graph_max_nodes();
 
         gf_res_reserve = std::make_unique<llm_graph_result>(max_nodes);
+        {
+            const char * env = getenv("LLAMA_GRAPH_CACHE");
+            const int n_pool = std::max(2, env ? atoi(env) : 16);
+            gf_res_prev.resize(n_pool);
+            gf_res_prev_used.assign(n_pool, 0);
+            gf_res_snap.assign(n_pool, {});
+        }
         for (auto & res : gf_res_prev) {
             res = std::make_unique<llm_graph_result>(max_nodes);
         }
@@ -624,6 +631,10 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+        }
+
+        if (cparams.ctx_other && !model.no_alloc()) {
+            model.init_ctx_other(*llama_get_model(cparams.ctx_other), backend_ptrs);
         }
 
         sched_reserve();
@@ -1831,17 +1842,110 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    // LLAMA_GRAPH_TIMING=1: the host time of each graph build and allocation
+    static const bool graph_timing = getenv("LLAMA_GRAPH_TIMING") != nullptr;
+
+    const bool pool = gf_res_prev.size() > 2;
+
+    // the graph of the previous compute, then (pool) any other built graph of the pool that fits the ubatch
+    llm_graph_result * res = nullptr;
+    bool cached = false;
+    if (!graph_reuse_disable && gf_res_prev_active &&
+            gf_res_prev_active->can_reuse(graph_params(gf_res_prev_active, ubatch, mctx, gtype))) {
+        res = gf_res_prev_active;
+    }
+    if (!graph_reuse_disable && !res && pool) {
+        for (auto & r : gf_res_prev) {
+            if (r.get() != gf_res_prev_active && r->can_reuse(graph_params(r.get(), ubatch, mctx, gtype))) {
+                res = r.get();
+                cached = true;
+                break;
+            }
+        }
+    }
+    const bool reuse = res != nullptr && !cached;
+    if (!res) {
+        if (pool) {
+            // the least recently used entry
+            size_t i_lru = 0;
+            for (size_t i = 1; i < gf_res_prev.size(); ++i) {
+                if (gf_res_prev_used[i] < gf_res_prev_used[i_lru]) {
+                    i_lru = i;
+                }
+            }
+            res = gf_res_prev[i_lru].get();
+        } else {
+            res = get_gf_res_prev();
+        }
+    }
+    size_t i_res = 0;
+    for (size_t i = 0; i < gf_res_prev.size(); ++i) {
+        if (gf_res_prev[i].get() == res) {
+            gf_res_prev_used[i] = ++gf_res_tick;
+            i_res = i;
+        }
+    }
+
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (reuse) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         n_reused++;
+    } else if (cached) {
+        // a built graph of the pool: the scheduler splits and allocates it again, as after a build. Its tensors
+        // still hold their addresses in the compute buffers from its last allocation; clear them so that the
+        // allocator places every one of them again
+        const int64_t t_start_us = graph_timing ? ggml_time_us() : 0;
+
+        if (cparams.pipeline_parallel) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        // the build order and the sources as built
+        {
+            const gf_snapshot & snap = gf_res_snap[i_res];
+            // by the list taken at the build, not by the usage of t->buffer: a compute buffer that grew since was
+            // freed, and its stale pointer must not be read (the views of model and memory tensors keep theirs)
+            for (ggml_tensor * t : snap.alloc) {
+                t->data   = nullptr;
+                t->buffer = nullptr;
+            }
+            GGML_ASSERT((int) snap.nodes.size() == ggml_graph_n_nodes(gf));
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = snap.nodes[i];
+                ggml_graph_nodes(gf)[i] = node;
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    node->src[s] = snap.srcs[(size_t) i*GGML_MAX_SRC + s];
+                }
+            }
+            for (const auto & [t, b] : snap.pins) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), t, b);
+            }
+        }
+
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            gf_res_prev_active = nullptr;
+            res->reset();
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+
+        gf_res_prev_active = res;
+        n_reused++;
+
+        if (graph_timing) {
+            LLAMA_LOG_WARN("graph-timing: n_tokens=%u n_outputs=%d nodes=%d cached alloc=%.3f ms\n",
+                    ubatch.n_tokens, n_outputs, ggml_graph_n_nodes(gf), (ggml_time_us() - t_start_us)/1000.0);
+        }
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -1849,11 +1953,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        const int64_t t_start_us = graph_timing ? ggml_time_us() : 0;
 
         gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        const int64_t t_built_us = graph_timing ? ggml_time_us() : 0;
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1861,10 +1965,40 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (pool) {
+            gf_snapshot & snap = gf_res_snap[i_res];
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            ggml_tensor ** nodes = ggml_graph_nodes(gf);
+            snap.nodes.assign(nodes, nodes + n_nodes);
+            snap.srcs.resize((size_t) n_nodes*GGML_MAX_SRC);
+            for (int i = 0; i < n_nodes; ++i) {
+                std::copy(nodes[i]->src, nodes[i]->src + GGML_MAX_SRC, snap.srcs.begin() + (size_t) i*GGML_MAX_SRC);
+            }
+            snap.pins.clear();
+            snap.alloc.clear();
+            for (ggml_tensor * t = ggml_get_first_tensor(res->get_ctx()); t != nullptr; t = ggml_get_next_tensor(res->get_ctx(), t)) {
+                if (ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t)) {
+                    snap.pins.emplace_back(t, b);
+                }
+                if (!t->buffer && (!t->view_src || !t->view_src->buffer)) {
+                    snap.alloc.push_back(t);
+                }
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            if (pool) {
+                res->reset();
+            }
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        if (graph_timing) {
+            LLAMA_LOG_WARN("graph-timing: n_tokens=%u n_outputs=%d nodes=%d build=%.3f ms alloc=%.3f ms\n",
+                    ubatch.n_tokens, n_outputs, ggml_graph_n_nodes(gf), (t_built_us - t_start_us)/1000.0,
+                    (ggml_time_us() - t_built_us)/1000.0);
         }
 
         gf_res_prev_active = res;

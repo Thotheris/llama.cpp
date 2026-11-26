@@ -87,7 +87,9 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // the attention of the iswa caches handles gaps between the streams of a ubatch (runs of consecutive
+                //   streams, see build_attn_iswa_impl), so the active sequences need not have consecutive ids
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, /*allow_gaps =*/ true);
             }
 
             if (ubatch.n_tokens == 0) {

@@ -787,8 +787,8 @@ public:
 };
 
 // hybrid iswa memory with a per-head attention bias that depends on the distance from the query to the cell (Inkling)
-// the KQ masks are always dense (rows == nullptr) and are filled from the same cells as the distances, so that the bias
-// gathered by distance lines up with the mask
+// the KQ masks are always dense (rows == nullptr) and are folded into the distances, so the mask tensors stay out of
+// the graph: only their shape is used
 class llm_graph_input_mem_hybrid_iswa_rel : public llm_graph_input_i {
 public:
     llm_graph_input_mem_hybrid_iswa_rel(
@@ -816,7 +816,8 @@ public:
     llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
 
-    // distance from the token to the cell, extent for the empty, future and more distant cells
+    // distance from the token to the cell, extent for the more distant cells and extent + 1 for the cells that the
+    // KQ mask masks (empty, future, other sequence, outside the window): the bias gathered by distance carries the mask
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
@@ -1557,10 +1558,12 @@ struct llm_graph_context {
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * bias_table, // [n_bins, n_head_q, n_tokens]
+            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream], or with rel_pos [n_cols, ...]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * rel_pos    = nullptr, // I32 [n_kv, n_tokens]: flash attention gathers its mask kq_b[rel_pos]
+                int32_t   masked_pos = -1) const;
 
     //
     // pooling

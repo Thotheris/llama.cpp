@@ -1100,6 +1100,13 @@ struct llama_model {
     // apply Hadamard transform to the lightning indexer keys
     virtual bool lid_k_hdmd() const { return false; }
 
+    // a context of this model that shares the weights of ctx_other's model (a draft head) calls this once its
+    // backends exist, before its graphs are reserved, to derive weights from that model on a device
+    virtual void init_ctx_other(const llama_model & model_other, const std::vector<ggml_backend_t> & backends) const {
+        GGML_UNUSED(model_other);
+        GGML_UNUSED(backends);
+    }
+
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
@@ -1171,8 +1178,24 @@ struct llama_model_base : public llama_model {
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
 
+    // hook: make the tensors an arch derives at load (not in the GGUF), after the GGUF tensors have their buffers
+    virtual void load_arch_tensors_derived(llama_model_loader & ml) { GGML_UNUSED(ml); }
+
+    // helper: allocate the tensors of ctx on buft as weights; the model takes ctx and frees it with the buffer
+    // with no_alloc the buffer is a dummy that only accounts for their size
+    void alloc_derived_tensors(ggml_context * ctx, ggml_backend_buffer_type_t buft, bool no_alloc);
+
+    // helper: the buffer type of the model buffer that holds weight t (null if none), valid from load_arch_tensors_derived
+    ggml_backend_buffer_type_t weight_buft(const ggml_tensor * t) const;
+
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
+
+    // optional: make tensors derived from the loaded weights (ggml does not fold constants), called once the data is loaded
+    virtual void load_arch_derived() {}
+
+    // helper: hand a context of derived tensors and their buffer to the model, freed with the model
+    void add_derived_buffer(ggml_context * ctx, ggml_backend_buffer_t buf);
 
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;

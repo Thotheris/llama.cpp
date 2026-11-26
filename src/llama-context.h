@@ -451,7 +451,21 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // With LLAMA_GRAPH_CACHE=<n> > 2 (default 16) the arenas are a pool of n built graphs: a ubatch whose graph is
+    // in the pool is allocated again by the scheduler without rebuilding it (e.g. speculative verify batches whose
+    // size changes from round to round, or a draft model that alternates between two graphs)
+    std::vector<llm_graph_result_ptr> gf_res_prev;
+    std::vector<uint64_t>             gf_res_prev_used; // last use tick of each pool entry
+    uint64_t                          gf_res_tick = 0;
+    // each pool graph as built: the scheduler reorders the nodes (backend graph_optimize) and points node sources at
+    // its own input copies, so a pool graph is put back into this state before it is split and allocated again
+    struct gf_snapshot {
+        std::vector<ggml_tensor *> nodes;
+        std::vector<ggml_tensor *> srcs; // GGML_MAX_SRC per node
+        std::vector<std::pair<ggml_tensor *, ggml_backend_t>> pins; // backends set by the graph callback
+        std::vector<ggml_tensor *> alloc; // the tensors (and views of them) without a buffer as built: the scheduler places them
+    };
+    std::vector<gf_snapshot>          gf_res_snap;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;

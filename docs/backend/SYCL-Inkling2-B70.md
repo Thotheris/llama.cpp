@@ -1,93 +1,123 @@
-# Inkling 2 Mini on the Intel Arc Pro B70 (SYCL)
+# Inkling 2 Mini on the Intel Arc Pro B70 with SYCL
 
-This branch adds Inkling 2 support to the ggml SYCL and Vulkan backends and tunes the SYCL backend for the Intel Arc
-Pro B70 (Xe2, 32 GB). It is a fork branch, not an upstream proposal. Everything below was measured on one machine
-with one model; other models and other Intel GPUs have not been validated on these code paths.
+This branch adds Inkling 2 to the ggml SYCL and Vulkan backends and tunes the SYCL backend for the Intel Arc Pro B70
+(Xe2, 32 GB). It is upstream `074f1f3` plus the commits listed at the end of this page.
 
-## What is in the branch
+Only one setup is validated: Inkling-2-Mini Q4_K_M on one Arc Pro B70. The SYCL changes touch shared code (mul_mat,
+flash attention, MoE). Other models and other Intel GPUs may work, but they are untested.
 
-| Commit (subject) | What it does |
-|---|---|
-| ggml: fused ops for the Inkling 2 graph, with CPU kernels | REL_BIAS, BLOCK_MIX(_NORM), GATE_MIX(_MV), SSM_CONV_HIST, L2_CLIP, the SiTU GLU and the other ops the graph uses, with reference CPU kernels |
-| vulkan: kernels for the Inkling 2 fused ops and Intel Xe2 paths | Vulkan kernels for the same ops |
-| sycl: Inkling 2 fused ops and the Xe2 MoE, dense and attention paths | SYCL kernels for the ops, the device-side MoE schedule and ESIMD grouped GEMM, dense projections through oneDNN on persistent f16 weight copies, flash attention with the relative-position bias computed in the kernel, decode attention, graph recording |
-| llama: graph pool, relative-position attention input, stream runs | graph reuse across ubatch shapes, the relative-position input of the attention |
-| model: Inkling 2 graph on the fused ops | the model graph (src/models/inkling2.cpp) |
-| dflash / speculative | the DSpark draft in the mtp.safetensors layout and its verify |
-| server: parallel slot sampling, draft slot limit, step log | server options (`LLAMA_SERVER_SAMPLE_THREADS`, `LLAMA_SPEC_MAX_SLOTS`, `LLAMA_SERVER_STEP_LOG`) |
-| devops: Intel Arc Pro B70 image | `.devops/intel-b70.Dockerfile` |
-| sycl: quantize a non-contiguous src1 in the layout the mul_mat op reads | a fix for a bug that is also in upstream: see "Known issues" |
+## Run the container image
 
-## Build
+1. Build the image from the repository root:
 
-Host build (oneAPI 2026.0, Level Zero, compute-runtime 26.40, IGC 2.42):
+	```bash
+	podman build -f .devops/intel-b70.Dockerfile --target server -t llama-inkling-b70 .
+	```
+
+2. Start the server. Mount a volume at `/root/.cache` so the compiled GPU kernels survive a restart:
+
+	```bash
+	podman run --rm --device /dev/dri -p 8080:8080 --shm-size 8g \
+		-e ONEAPI_DEVICE_SELECTOR=level_zero:0 -e GGML_SYCL_ENABLE_GRAPH=1 \
+		-v llama-sycl-cache:/root/.cache \
+		-v /path/to/Inkling-2-Mini-Q4_K_M.gguf:/models/Inkling-2-Mini-Q4_K_M.gguf:ro \
+		llama-inkling-b70 -m /models/Inkling-2-Mini-Q4_K_M.gguf --host 0.0.0.0 --port 8080 \
+		--ctx-size 131072 --n-gpu-layers 999 --parallel 1 --flash-attn on \
+		--batch-size 2048 --ubatch-size 2048 --jinja --reasoning-format deepseek \
+		--temp 1.0 --top-p 1.0 --top-k 0 --min-p 0.0 --no-mmproj
+	```
+
+The first start compiles the kernels, so the server takes about 60 s to report healthy. With the cache volume, later
+starts take about 7 s.
+
+`intel-b70.Dockerfile` is `intel.Dockerfile` with an older toolchain. It pins oneAPI 2026.0 and oneDNN 3.11. oneDNN
+3.13 and 3.14 (oneAPI 2026.1) spend about 60 ms the first time each matmul shape runs. In a new container, that made
+prefill 7 to 8% slower on every new prompt length.
+
+## Build on the host
+
+The host build needs oneAPI 2026.0, Level Zero, compute-runtime 26.40 and IGC 2.42:
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
 cmake -B build-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL \
-      -DGGML_SYCL_F16=ON -DGGML_SYCL_DNN=ON -DGGML_SYCL_GRAPH=ON \
-      -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+	-DGGML_SYCL_F16=ON -DGGML_SYCL_DNN=ON -DGGML_SYCL_GRAPH=ON \
+	-DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 cmake --build build-sycl -j
 ```
 
-Container image (the build the measurements below were checked against):
+Run `build-sycl/bin/llama-server` with the same environment and arguments as the container.
 
-```bash
-podman build -f .devops/intel-b70.Dockerfile --target server -t llama-inkling-b70 .
-```
+## Environment
 
-`intel-b70.Dockerfile` differs from `intel.Dockerfile` only in the toolchain: it pins the oneAPI 2026.0 base image and
-the oneDNN 2026.0 package (oneDNN 3.11). With oneDNN 3.13 (oneAPI 2026.1) every new matmul shape costs about 60 ms on
-first use, which made prefill 7-8% slower in a fresh container.
+- Set `GGML_SYCL_ENABLE_GRAPH=1`. It records the decode step as a SYCL graph. Without it, each kernel launch costs 3
+  to 4 µs on the host.
+- Do not set `SYCL_CACHE_PERSISTENT=1`. With oneAPI 2026.0 and compute-runtime 26.40, it crashed or hung the server
+  and left GPU page faults. The default cache in `/root/.cache` works.
+- Keep the default context checkpoints. You do not need `--ctx-checkpoints 0`.
 
-## Run
+## Debug switches
 
-```bash
-ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_ENABLE_GRAPH=1 \
-llama-server -m Inkling-2-Mini-Q4_K_M.gguf --ctx-size 131072 --n-gpu-layers 999 --parallel 1 \
-  --flash-attn on --batch-size 2048 --ubatch-size 2048 --jinja --reasoning-format deepseek \
-  --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0.0
-```
-
-- `GGML_SYCL_ENABLE_GRAPH=1` records the decode graph; without it every kernel launch costs 3-4 us on the host.
-- In a container, mount a volume at `/root/.cache`. The first start JIT-compiles the kernels (about 50 s to load and
-  a slow first request per new shape); with the cache kept the load takes about 7 s.
-- Do not set `SYCL_CACHE_PERSISTENT=1`: on this stack it crashed or hung the server and left GPU page faults.
-
-Switches that change kernels, for debugging (defaults are the measured configuration):
+These environment variables turn kernel paths off, for bisecting a wrong result. The defaults are the measured
+configuration.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `GGML_SYCL_FA_XE=0` | 1 | turn off the Xe2 flash-attention prefill kernel |
-| `GGML_SYCL_FA_XE_THR=t` | 0 | lazy softmax rescale threshold; 0 rescales exactly. With 5.5 a needle in a 110K prompt was lost |
-| `GGML_SYCL_DENSE_DNN=0` | 1 | dense projections without oneDNN |
-| `GGML_SYCL_DENSE_DNN_MIN_COLS=n` | 48 | smallest batch that takes oneDNN |
-| `GGML_SYCL_XMX_MAX_COLS=n` | | largest batch that takes the XMX GEMM on reordered weights |
-| `LLAMA_INKLING2_MIX_NORM_BATCH=0` | 1 | unfused block-mix norms for batches over 8 tokens |
+| `GGML_SYCL_FA_XE` | `1` | `0` turns off the Xe2 flash-attention prefill kernel. |
+| `GGML_SYCL_FA_XE_THR` | `0` | The lazy softmax rescale threshold. `0` rescales exactly. At `5.5`, the model missed a needle in a 110K prompt. |
+| `GGML_SYCL_DENSE_DNN` | `1` | `0` runs the dense projections without oneDNN. |
+| `GGML_SYCL_DENSE_DNN_MIN_COLS` | `48` | The smallest batch that uses oneDNN for the dense projections. |
+| `GGML_SYCL_XMX_MAX_COLS` | `80` | The largest batch that uses the XMX GEMM on reordered weights. `0` turns it off. |
+| `LLAMA_INKLING2_MIX_NORM_BATCH` | `1` | `0` uses unfused block-mix norms for batches of more than 8 tokens. |
+| `LLAMA_SERVER_SAMPLE_THREADS` | `8` | The threads that sample the server's slots in parallel. |
+| `LLAMA_SPEC_MAX_SLOTS` | `1` | The server stops drafting while more slots than this generate. `0` means no limit. |
+| `LLAMA_SERVER_STEP_LOG` | unset | Any value prints one line per server step, with the ubatch sizes. |
 
-## Measured (Inkling-2-Mini Q4_K_M, Arc Pro B70)
+## Measured performance
 
-| Metric | Value | How |
-|---|---|---|
-| prefill, llama-bench pp2048 (-ub 2048) | 6,387 tok/s | median of 6, bracketed by controls |
-| prefill, llama-bench pp512 | about 4,700 tok/s | median of 6 |
-| decode, llama-bench tg128 | 98 tok/s | median of 6 |
-| chat prefill, 2k / 8k prompt | about 5,300 / 5,860 tok/s | llama-server, -ub 2048 |
-| chat decode, empty / 8k context | 94 / 84 tok/s | llama-server |
-| VRAM at --ctx-size 131072 | about 24 GiB | driver residency |
-| KL divergence vs Vulkan logits | 0.0018-0.0028 | llama-perplexity --kl-divergence, ub 4 to 2048 |
+All numbers are for Inkling-2-Mini Q4_K_M on one Arc Pro B70. The last column names the commit that was measured.
+`8a796214e` has the same code as the branch head. Only documentation changed after it.
 
-The chat and VRAM rows were measured on the commit before the last fix, which only changes batches of 9 to 47
-tokens whose input is a strided view; the llama-bench and KLD rows were measured on the final commit.
+| Metric | Value | How | Commit |
+|---|---|---|---|
+| Prefill, `llama-bench -p 2048 -ub 2048` | 6,387 tok/s | median of 6, between two control runs | `8a796214e` |
+| Decode, `llama-bench -n 128` | 98.2 tok/s | median of 6, between two control runs | `8a796214e` |
+| Prefill, `llama-bench -p 512` | 4,710 tok/s | median of 6 | `abdbb4b0b` |
+| Chat prefill, 2K and 8K prompts | 5,300 and 5,860 tok/s | `llama-server`, `-ub 2048` | `abdbb4b0b` |
+| Chat decode, empty and 8K context | 94 and 84 tok/s | `llama-server` | `abdbb4b0b` |
+| Device memory at `--ctx-size 131072` | 24,143 MiB | the model 16,412, KV and state 4,579, compute 3,151 | `abdbb4b0b` |
+| KL divergence against the Vulkan backend's logits | 0.0018 to 0.0028 | `llama-perplexity --kl-divergence`, ubatch 4, 12, 32, 128, 512 and 2048 | `8a796214e` |
 
-Accuracy checks on the final commit: KLD against the Vulkan backend at ubatch sizes 4, 12, 32, 128, 512 and 2048; a
-chat needle at 92K tokens (91,890 prompt tokens) found at temperature 0.6 and 0; tool calls 10/10 on a fixed prompt.
+The last fix only changes batches of 9 to 47 tokens whose input is a strided view, so the `abdbb4b0b` rows still
+apply.
 
-## Known issues and limits
+These accuracy checks passed on `8a796214e`, at the arguments above:
 
-- Only Inkling-2-Mini (Q4_K_M) on the Arc Pro B70 was validated. The SYCL changes touch shared paths (mul_mat,
-  flash attention, MoE); other models may work but are untested.
-- The non-contiguous src1 bug fixed in the last commit is in upstream too (ggml_sycl_op_mul_mat quantized a copied
-  src1 as block_q8_1 even when the kernel reads the reordered SoA layout). Several other call sites that quantize
-  into the reorder layout straight from src1 have not been audited.
-- `--ctx-checkpoints 0` is not needed. The checkpoint split of chat prompts was what exposed the bug above.
+- A tool-call prompt returned a correct `get_weather` call 10 times out of 10.
+- The model found a needle in a 91,890-token chat prompt at temperature 0.6 and at temperature 0.
+
+## Known limits
+
+- `ggml_sycl_op_mul_mat` had a bug that upstream also has. When src1 was not contiguous, the op copied it and then
+  quantized it as `block_q8_1`. The kernels for reordered weights read a per-row layout instead, with all of a row's
+  int8 values first and its scales after them. Inkling 2's chat prompts hit this through a 12-token ubatch, which
+  wrote NaN into the KV cache. Commit `8a796214e` fixes the copy path. Other code paths also quantize into the
+  reordered layout straight from src1: the MoE multi-column path and the fused GLU XMX path. They have not been
+  checked.
+- Only the SYCL path was measured on the final commits. The Vulkan kernels were last checked before the fix, and the
+  fix does not touch them.
+
+## What the branch changes
+
+| Commit | What it adds |
+|---|---|
+| `e794a27cd` ggml: fused ops for the Inkling 2 graph, with CPU kernels | The fused ops the graph uses (REL_BIAS, BLOCK_MIX and BLOCK_MIX_NORM, GATE_MIX and GATE_MIX_MV, SSM_CONV_HIST, L2_CLIP, the SiTU GLU), with reference CPU kernels |
+| `7803b4dd1` vulkan: kernels for the Inkling 2 fused ops and Intel Xe2 paths | Vulkan kernels for the same ops |
+| `bd49c7639` sycl: Inkling 2 fused ops and the Xe2 MoE, dense and attention paths | SYCL kernels for the ops, a MoE schedule built on the device, ESIMD grouped GEMMs, dense projections through oneDNN on f16 weight copies, flash attention that computes the relative-position bias, decode attention, and graph recording |
+| `3c0e6ca60` llama: graph pool, relative-position attention input, stream runs | Graph reuse across ubatch shapes, and the relative-position input of the attention |
+| `6b0bf1233` model: Inkling 2 graph on the fused ops | The model graph in `src/models/inkling2.cpp` |
+| `acbcf5e6a` dflash: Inkling 2 DSpark draft in the mtp.safetensors layout | The DSpark draft model in a second tensor layout |
+| `a3972d6b0` speculative: Inkling 2 DSpark verify inside one cell block, adaptive pausing | A verify whose rows match one-token decode, and draft pausing when acceptance is low |
+| `c0fb3d779` server: parallel slot sampling, draft slot limit, step log | `LLAMA_SERVER_SAMPLE_THREADS`, `LLAMA_SPEC_MAX_SLOTS` and `LLAMA_SERVER_STEP_LOG` |
+| `abdbb4b0b` devops: Intel Arc Pro B70 image on the validated oneAPI 2026.0 toolchain | `.devops/intel-b70.Dockerfile` |
+| `8a796214e` sycl: quantize a non-contiguous src1 in the layout the mul_mat op reads | The fix described in "Known limits" |

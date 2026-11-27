@@ -1,8 +1,7 @@
-# Intel Arc Pro B70 (Battlemage) image with the toolchain the Inkling 2 SYCL paths were validated on:
-# oneAPI DPC++ 2026.0.0 and oneDNN 3.11.2. Newer oneDNN releases (3.13, 3.14) pay about 60 ms the first time
-# each new GEMM shape runs, which shows up as slower prefill on every new prompt length; 3.11 does not.
-# Otherwise identical to intel.Dockerfile. Mount a volume at /root/.cache to keep the Level Zero kernel cache
-# between starts (the first start compiles the kernels, about 50 s).
+# The Intel SYCL image (intel.Dockerfile) on the toolchain the Inkling 2 SYCL kernels were validated on:
+# oneAPI DPC++ 2026.0.0 and oneDNN 3.11.2. oneDNN 3.13 and 3.14 spend about 60 ms the first time each matmul shape
+# runs, which makes prefill slower on every new prompt length.
+# Mount a volume at /root/.cache to keep the compiled GPU kernels. The first start compiles them, which takes about 60 s.
 ARG ONEAPI_VERSION=2026.0.0-devel-ubuntu24.04
 ARG ONEDNN_PACKAGE=intel-oneapi-dnnl-devel-2026.0=2026.0.1-55
 ARG BUILD_DATE=N/A
